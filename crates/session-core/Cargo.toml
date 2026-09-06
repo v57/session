@@ -1,0 +1,27 @@
+[package]
+name = "session-core"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: The bootstrap card is the SOLE owner of every manifest dependency entry.
+# Later engine cards MUST NOT edit this file. Every dep the engine needs is
+# declared here up front, including BOTH vte (drives the emulator) and vt100
+# (candidate) so the emulator card can pick its backend with no manifest edit.
+
+[dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+portable-pty = "0.9"
+vte = "0.15"
+vt100 = "0.15"                       # emulator backend candidate; emulator card picks
+interprocess = { version = "2", features = ["tokio"] }  # cross-platform local stream
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+crossterm = "0.28"                   # raw-mode helpers (used by the client proxy)
+dirs = "5"                           # per-user socket path resolution
+log = "0.4"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

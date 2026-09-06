@@ -1,0 +1,22 @@
+[package]
+name = "session-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "session"
+path = "src/main.rs"
+
+# NOTE: The bootstrap card is the SOLE owner of every manifest dependency entry.
+# Later CLI cards MUST NOT edit this file.
+
+[dependencies]
+session-core = { path = "../session-core" }
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+crossterm = "0.28"                   # raw-mode byte proxy
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+dirs = "5"                           # resolve the per-user socket path for the CLI
