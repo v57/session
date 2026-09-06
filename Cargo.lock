@@ -714,10 +714,12 @@ dependencies = [
  "crossterm",
  "dirs",
  "env_logger",
+ "interprocess",
  "log",
  "serde",
  "serde_json",
  "session-core",
+ "tempfile",
  "tokio",
 ]
 

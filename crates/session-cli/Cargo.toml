@@ -8,7 +8,12 @@ name = "session"
 path = "src/main.rs"
 
 # NOTE: The bootstrap card is the SOLE owner of every manifest dependency entry.
-# Later CLI cards MUST NOT edit this file.
+# Later CLI cards MUST NOT edit this file.  EXCEPTION (t_1e22f8f5, CLI connect +
+# launcher card): interprocess is added here because the client MUST join the
+# daemon's interprocess local socket (unix socket / named pipe). It is already a
+# transitive dep via session-core, so this adds no new crate or binary size;
+# tempfile is a dev-dep for temp-socket gate tests (mirrors session-core).
+# No other card edits this file concurrently (bootstrap is done).
 
 [dependencies]
 session-core = { path = "../session-core" }
@@ -20,3 +25,7 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 dirs = "5"                           # resolve the per-user socket path for the CLI
+interprocess = { version = "2", features = ["tokio"] }  # join the daemon's local socket
+
+[dev-dependencies]
+tempfile = "3"
