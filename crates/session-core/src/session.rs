@@ -47,7 +47,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc};
-use uuid::Uuid;
 
 /// Identifies an attached client. The daemon sets this to a per-connection id.
 pub type ClientId = String;
@@ -91,7 +90,7 @@ struct Client {
 
 /// One PTY-backed terminal session and its clients.
 pub struct Session {
-    id: Uuid,
+    id: String,
     create_time: SystemTime,
     title: String,
     /// Shared with the pump task; guards are held only for non-awaiting work.
@@ -115,6 +114,7 @@ impl Session {
     ///
     /// MUST be called from within a Tokio runtime (it spawns the pump task).
     pub fn spawn(
+        name: &str,
         argv: Option<Vec<OsString>>,
         scrollback_cap: usize,
     ) -> anyhow::Result<Self> {
@@ -142,7 +142,7 @@ impl Session {
         });
 
         Ok(Self {
-            id: Uuid::new_v4(),
+            id: name.to_string(),
             create_time: SystemTime::now(),
             title: make_title(argv),
             emulator,
@@ -155,8 +155,8 @@ impl Session {
     }
 
     /// The session's unique id.
-    pub fn id(&self) -> Uuid {
-        self.id
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// When the session was created.
@@ -414,7 +414,7 @@ mod tests {
         // `cat` reads stdin and echoes it, so input from B round-trips to a
         // broadcast Output event both clients observe.
         let argv = shell_argv("cat");
-        let mut session = Session::spawn(Some(argv), 2000).expect("spawn session");
+        let mut session = Session::spawn("test-session", Some(argv), 2000).expect("spawn session");
 
         let AttachHandle { redraw: _ra, receiver: mut rx_a } =
             session.attach("a".into()).expect("attach a");
@@ -470,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn set_size_primary_only() {
         let argv = shell_argv("cat");
-        let mut session = Session::spawn(Some(argv), 2000).expect("spawn session");
+        let mut session = Session::spawn("test-session", Some(argv), 2000).expect("spawn session");
         session.attach("primary".into()).expect("attach primary");
         session.attach("other".into()).expect("attach other");
 
@@ -494,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn detach_promotes_next_and_applies_its_size() {
         let argv = shell_argv("cat");
-        let mut session = Session::spawn(Some(argv), 2000).expect("spawn session");
+        let mut session = Session::spawn("test-session", Some(argv), 2000).expect("spawn session");
         session.attach("old".into()).expect("attach old"); // primary at 24x80
         session.attach("new".into()).expect("attach new");
         session

@@ -12,7 +12,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::time::UNIX_EPOCH;
-use uuid::Uuid;
 
 /// Lifecycle status of a session, reported by [`Registry::list`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,7 +26,7 @@ pub enum SessionStatus {
 /// A one-session summary returned by [`Registry::list`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
-    pub id: Uuid,
+    pub id: String,
     /// Display title: the child command, or the login shell.
     pub title: String,
     /// Creation time as unix epoch seconds.
@@ -39,7 +38,7 @@ pub struct SessionInfo {
 
 /// The daemon's map of live sessions, keyed by id.
 pub struct Registry {
-    sessions: HashMap<Uuid, Session>,
+    sessions: HashMap<String, Session>,
     /// Scrollback lines applied to every session this registry spawns.
     scrollback_cap: usize,
 }
@@ -62,25 +61,24 @@ impl Registry {
     ///
     /// `cmd == None` runs the user's login shell; `Some(argv)` runs `argv[0]`
     /// with the remaining entries as arguments.
-    pub fn create_session(&mut self, cmd: Option<Vec<OsString>>) -> anyhow::Result<Uuid> {
-        let session = Session::spawn(cmd, self.scrollback_cap)?;
-        let id = session.id();
-        self.sessions.insert(id, session);
-        Ok(id)
+    pub fn create_session(&mut self, name: &str, cmd: Option<Vec<OsString>>) -> anyhow::Result<()> {
+        let session = Session::spawn(name, cmd, self.scrollback_cap)?;
+        self.sessions.insert(name.to_string(), session);
+        Ok(())
     }
 
     /// Borrow a live session by id.
-    pub fn find(&self, id: &Uuid) -> Option<&Session> {
+    pub fn find(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
     }
 
     /// Mutable borrow of a live session (needed for attach/set_size/detach).
-    pub fn find_mut(&mut self, id: &Uuid) -> Option<&mut Session> {
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut Session> {
         self.sessions.get_mut(id)
     }
 
     /// Attach a client to a session, returning its replay + live stream.
-    pub fn attach(&mut self, id: &Uuid, client_id: ClientId) -> anyhow::Result<AttachHandle> {
+    pub fn attach(&mut self, id: &str, client_id: ClientId) -> anyhow::Result<AttachHandle> {
         let session = self
             .sessions
             .get_mut(id)
@@ -89,7 +87,7 @@ impl Registry {
     }
 
     /// Kill a session (terminate its child) and remove it from the registry.
-    pub fn kill(&mut self, id: &Uuid) -> anyhow::Result<()> {
+    pub fn kill(&mut self, id: &str) -> anyhow::Result<()> {
         {
             let session = self
                 .sessions
@@ -113,7 +111,7 @@ impl Registry {
 
     /// Remove a session without killing its child (for callers that already
     /// reaped it). Returns the removed session, if present.
-    pub fn remove(&mut self, id: &Uuid) -> Option<Session> {
+    pub fn remove(&mut self, id: &str) -> Option<Session> {
         self.sessions.remove(id)
     }
 
@@ -123,7 +121,7 @@ impl Registry {
             .sessions
             .values()
             .map(|s| SessionInfo {
-                id: s.id(),
+                id: s.id().to_string(),
                 title: s.title().to_string(),
                 created: s
                     .create_time()
@@ -138,7 +136,7 @@ impl Registry {
                 },
             })
             .collect();
-        infos.sort_by_key(|i| (i.created, i.id));
+        infos.sort_by_key(|i| (i.created, i.id.clone()));
         infos
     }
 
@@ -153,7 +151,7 @@ impl Registry {
     }
 
     /// True if a session with this id exists.
-    pub fn contains(&self, id: &Uuid) -> bool {
+    pub fn contains(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
     }
 }
@@ -176,23 +174,24 @@ mod tests {
     #[tokio::test]
     async fn create_list_kill_roundtrip() {
         let mut reg = Registry::new(2000);
-        let id = reg.create_session(None).expect("create shell session");
+        let name = "s1";
+        reg.create_session(name, None).expect("create shell session");
 
-        assert!(reg.contains(&id));
-        assert!(reg.find(&id).is_some());
+        assert!(reg.contains(name));
+        assert!(reg.find(name).is_some());
         assert_eq!(reg.len(), 1);
 
         let list = reg.list();
         assert_eq!(list.len(), 1);
         let info = &list[0];
-        assert_eq!(info.id, id);
+        assert_eq!(info.id, name);
         assert_eq!(info.attached_count, 0);
         assert_eq!(info.status, SessionStatus::Running);
         assert!(!info.title.is_empty(), "title should reflect the shell");
 
-        reg.kill(&id).expect("kill session");
-        assert!(reg.find(&id).is_none());
-        assert!(!reg.contains(&id));
+        reg.kill(name).expect("kill session");
+        assert!(reg.find(name).is_none());
+        assert!(!reg.contains(name));
         assert!(reg.is_empty());
         assert!(reg.list().is_empty());
     }
@@ -201,14 +200,14 @@ mod tests {
     #[tokio::test]
     async fn custom_cmd_create_attach_kill_all() {
         let mut reg = Registry::new(2000);
-        let id = reg.create_session(Some(shell_argv("cat"))).expect("create cat");
+        reg.create_session("cat-session", Some(shell_argv("cat"))).expect("create cat");
 
-        let handle = reg.attach(&id, "client-a".into()).expect("attach");
+        let handle = reg.attach("cat-session", "client-a".into()).expect("attach");
         let _redraw = handle.redraw;
 
         // find_mut exposes the underlying session for mutable control paths.
         {
-            let s = reg.find_mut(&id).expect("find_mut session");
+            let s = reg.find_mut("cat-session").expect("find_mut session");
             assert_eq!(s.attached(), 1);
         }
         assert_eq!(reg.list()[0].attached_count, 1);
@@ -221,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn kill_unknown_id_is_error() {
         let mut reg = Registry::new(2000);
-        assert!(reg.kill(&Uuid::new_v4()).is_err());
+        assert!(reg.kill("nope").is_err());
     }
 
     // from_config inherits the scrollback cap.
