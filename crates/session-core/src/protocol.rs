@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version, bumped on any incompatible wire change. Both the client
 /// and the daemon advertise this in their `Hello` frame.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: added [`DaemonToClient::Exit`] so a client is told when its session's
+/// child process exits and can close instead of lingering in raw mode.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A frame from the client (the CLI / proxy) to the daemon.
 ///
@@ -76,6 +79,9 @@ pub enum DaemonToClient {
     },
     /// The referenced session was killed.
     Killed { session_id: String },
+    /// The referenced session's child process exited. The daemon is closing the
+    /// session; an attached client should end its view instead of lingering.
+    Exit { session_id: String },
     /// Snapshot of all live sessions.
     Listing { sessions: Vec<SessionInfo> },
     /// An error for the preceding request.
@@ -350,6 +356,9 @@ mod tests {
         roundtrip_frame(&DaemonToClient::Killed {
             session_id: "s9".into(),
         });
+        roundtrip_frame(&DaemonToClient::Exit {
+            session_id: "s9".into(),
+        });
         roundtrip_frame(&DaemonToClient::Listing {
             sessions: vec![
                 SessionInfo::new("s1"),
@@ -437,7 +446,7 @@ mod tests {
         assert!(matches!(
             err,
             ProtocolError::VersionMismatch {
-                expected: 1,
+                expected: PROTOCOL_VERSION,
                 got: 0
             }
         ));

@@ -115,6 +115,28 @@ impl Registry {
         self.sessions.remove(id)
     }
 
+    /// Remove every session whose child process has exited (e.g. the shell
+    /// `exit`ed, or a one-shot command finished). Returns how many were reaped.
+    ///
+    /// Dropping a session closes its command channel; the pump already finished
+    /// on child exit, so nothing is left running. Call this periodically (the
+    /// daemon's background reaper) and before operations that must only observe
+    /// live sessions (`list`, `attach`, create-or-attach) so a finished session
+    /// is never reported or attached to as a zombie.
+    pub fn reap_exited(&mut self) -> usize {
+        let zombies: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_exited())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let reaped = zombies.len();
+        for id in &zombies {
+            self.sessions.remove(id);
+        }
+        reaped
+    }
+
     /// Summaries of every session, in creation order (ties broken by id).
     pub fn list(&self) -> Vec<SessionInfo> {
         let mut infos: Vec<SessionInfo> = self
@@ -160,6 +182,7 @@ impl Registry {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::time::{Duration, Instant};
 
     fn shell_argv(snippet: &str) -> Vec<OsString> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -221,6 +244,35 @@ mod tests {
     async fn kill_unknown_id_is_error() {
         let mut reg = Registry::new(2000);
         assert!(reg.kill("nope").is_err());
+    }
+
+    // A session whose child process exits is reaped: `reap_exited` drops it so
+    // `list` no longer reports it and create-or-attach would make a fresh one.
+    #[tokio::test]
+    async fn reap_exited_removes_finished_session() {
+        let mut reg = Registry::new(2000);
+        reg.create_session("done", Some(shell_argv("exit 0")))
+            .expect("create a command that exits immediately");
+        assert_eq!(reg.len(), 1);
+
+        // The pump observes the child's exit asynchronously. Wait for it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if reg.find("done").map(|s| s.is_exited()).unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reg.find("done").map(|s| s.is_exited()).unwrap_or(false),
+            "the child should be observed as exited"
+        );
+
+        // Reaping drops the finished session from the map and the listing.
+        assert_eq!(reg.reap_exited(), 1, "one exited session should be reaped");
+        assert!(reg.find("done").is_none());
+        assert!(!reg.contains("done"));
+        assert!(reg.list().is_empty(), "a reaped session must not be listed");
     }
 
     // from_config inherits the scrollback cap.

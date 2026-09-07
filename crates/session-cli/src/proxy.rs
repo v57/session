@@ -244,7 +244,7 @@ pub fn attach(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async move {
+    let outcome = rt.block_on(async move {
         let conn = Conn::connect(config).await?;
 
         // Report the real terminal size immediately (spec: "send Resize
@@ -254,8 +254,8 @@ pub fn attach(
         // SIGWINCH / terminate watchers that push into the proxy loop below.
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
         let (term_tx, term_rx) = mpsc::unbounded_channel();
-        spawn_resize_watcher(resize_tx);
-        spawn_terminate_watcher(term_tx);
+        let resize_task = spawn_resize_watcher(resize_tx);
+        let term_task = spawn_terminate_watcher(term_tx);
 
         // The attach (or create-attach) frame; a custom command may carry the
         // TERM prefix so the daemon-spawned child sees a truecolor terminal.
@@ -278,11 +278,33 @@ pub fn attach(
         )
         .await;
 
+        // Stop the signal/resize watchers before the runtime drops. They never
+        // complete on their own (they await signals forever), and leaving them
+        // running would make the tokio runtime's `drop` block indefinitely,
+        // hanging the proxy after the session ends.
+        resize_task.abort();
+        term_task.abort();
+
         if opts.raw_mode {
             let _ = crossterm::terminal::disable_raw_mode();
         }
         result
-    })
+    });
+
+    // Exit directly rather than letting the runtime drop. `tokio::io::stdin()`
+    // spawns a background thread trapped in a blocking `read(2)` on the
+    // still-open terminal, and `Runtime::drop` blocks until every spawned task
+    // completes — which that reader never does until the fd closes. Raw mode is
+    // already restored above, so we terminate the process with the mapped code
+    // instead of unwinding through a runtime that can never shut down. This is
+    // why session-auto-close (and clean detach) exit promptly instead of hanging.
+    match outcome {
+        Ok(_) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("session: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The testable core of the proxy.
@@ -412,14 +434,20 @@ where
             DaemonToClient::Killed { session_id } => {
                 eprintln!("session: session {session_id} was killed")
             }
+            // The session's child exited: end the proxy so the caller's view
+            // closes cleanly instead of lingering in raw mode on a dead shell.
+            DaemonToClient::Exit { .. } => return Ok(()),
             _ => {} // Hello/Listing/other strays are ignored after attach
         }
     }
 }
 
-/// Watch for SIGWINCH (Unix) and push the re-read terminal size into `tx`.
+/// Watch for SIGWINCH (Unix) and push the re-read terminal size into `tx`. The
+/// returned handle lets the proxy abort the watcher before the runtime drops
+/// (a signal watcher never completes, so leaving it running would make the
+/// runtime's `drop` block forever).
 #[cfg(unix)]
-fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) {
+fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
             Ok(mut sig) => {
@@ -435,12 +463,12 @@ fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) {
                 std::future::pending::<()>().await;
             }
         }
-    });
+    })
 }
 
 /// Watch for SIGWINCH on Windows by polling the console size periodically.
 #[cfg(not(unix))]
-fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) {
+fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last = terminal_size().ok();
         loop {
@@ -453,12 +481,12 @@ fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) {
                 last = now;
             }
         }
-    });
+    })
 }
 
 /// Watch for SIGTERM (Unix) and push a single termination signal into `tx`.
 #[cfg(unix)]
-fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) {
+fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut sig) => {
@@ -474,16 +502,16 @@ fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) {
                 std::future::pending::<()>().await;
             }
         }
-    });
+    })
 }
 
 /// No SIGTERM to watch on non-Unix; keep the channel open (never fires).
 #[cfg(not(unix))]
-fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) {
+fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _ = tx;
         std::future::pending::<()>().await;
-    });
+    })
 }
 
 #[cfg(test)]
@@ -736,6 +764,106 @@ mod tests {
         assert!(
             res.is_err(),
             "a daemon Error frame must be fatal, not swallowed"
+        );
+    }
+
+    // When the session's child exits, the daemon sends an Exit frame; the
+    // forwarder must end CLEANLY (Ok, not an error) so the proxy closes its view
+    // instead of lingering in raw mode on a dead shell.
+    #[tokio::test]
+    async fn forward_daemon_exit_is_clean() {
+        let frame = DaemonToClient::Exit {
+            session_id: "s1".into(),
+        }
+        .to_frame()
+        .unwrap();
+        let mut reader = BufReader::new(&frame[..]);
+        let res = forward_daemon_to_stdout(&mut reader, &mut tokio::io::sink()).await;
+        assert!(
+            res.is_ok(),
+            "a daemon Exit frame must end the forwarder cleanly, not error"
+        );
+    }
+
+    // Full proxy loop: a fake daemon that sends Hello -> Attached -> (child
+    // exits) Exit must make `proxy_loop` return `ProxyExit::Closed`, proving the
+    // session-auto-close path end to end (no raw-mode hang).
+    #[tokio::test]
+    async fn proxy_closes_on_daemon_exit() {
+        let dir = tempdir().unwrap();
+        let cfg = temp_config(&dir);
+        let name = cfg.socket_path.clone().to_fs_name::<GenericFilePath>().unwrap();
+        let listener = ListenerOptions::new()
+            .name(name)
+            .try_overwrite(true)
+            .create_tokio()
+            .unwrap();
+        tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let (mut read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(&mut read_half);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await; // Hello
+            let _ = write_half
+                .write_all(
+                    &DaemonToClient::Hello {
+                        daemon_version: PROTOCOL_VERSION,
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await;
+            line.clear();
+            let _ = reader.read_line(&mut line).await; // AttachCreate
+            let _ = write_half
+                .write_all(
+                    &DaemonToClient::Attached {
+                        session_id: "s1".into(),
+                        redraw_bytes: b"\x1b[2J".to_vec(),
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await;
+            line.clear();
+            let _ = reader.read_line(&mut line).await; // Resize
+            // The session child exited.
+            let _ = write_half
+                .write_all(
+                    &DaemonToClient::Exit {
+                        session_id: "s1".into(),
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await;
+            // Hold the socket open a moment so the proxy can finish cleanly.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let (in_r, _in_w) = tokio::io::duplex(64); // stdin stays open, no input
+        let (_out_r, out_w) = tokio::io::duplex(64);
+        let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+        let (_term_tx, term_rx) = mpsc::unbounded_channel();
+        let exit = proxy_loop(
+            conn,
+            in_r,
+            out_w,
+            ClientToDaemon::AttachCreate {
+                session_id: "s1".into(),
+                cmd: None,
+            },
+            (24, 80),
+            resize_rx,
+            term_rx,
+        )
+        .await
+        .expect("proxy_loop should not error on session exit");
+        assert_eq!(
+            exit,
+            ProxyExit::Closed,
+            "proxy must close (not hang) when the session's child exits"
         );
     }
 

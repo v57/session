@@ -82,6 +82,10 @@ use uuid::Uuid;
 const PROBE_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long the probe will wait to connect at all.
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// How often the background reaper drops sessions whose child process has
+/// exited, so the registry never accumulates zombie sessions and `list` stays
+/// clean even when nothing touches a finished session.
+const REAP_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The long-lived session daemon: owns the socket + registry.
 pub struct Daemon {
@@ -133,6 +137,20 @@ pub async fn run(config: Config) -> Result<()> {
     log::info!("session daemon listening on {}", socket_path.display());
 
     let registry = Arc::new(Mutex::new(Registry::from_config(&config)));
+
+    // Background reaper: drop sessions whose child process has exited, so a
+    // session that ends (e.g. the shell `exit`s, a one-shot command finishes)
+    // is removed within ~REAP_INTERVAL and `list` never reports a zombie.
+    {
+        let reaper = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REAP_INTERVAL);
+            loop {
+                tick.tick().await;
+                reaper.lock().unwrap().reap_exited();
+            }
+        });
+    }
 
     loop {
         match listener.accept().await {
@@ -280,13 +298,16 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::List => {
-                let sessions = registry
-                    .lock()
-                    .unwrap()
-                    .list()
-                    .into_iter()
-                    .map(to_wire_session_info)
-                    .collect();
+                // Reap finished sessions first (guard dropped before the await)
+                // so a zombie is never reported.
+                let sessions = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.reap_exited();
+                    reg.list()
+                        .into_iter()
+                        .map(to_wire_session_info)
+                        .collect::<Vec<_>>()
+                };
                 send_frame(&writer_tx, DaemonToClient::Listing { sessions }).await?;
             }
 
@@ -319,10 +340,12 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::Attach { session_id } => {
-                // Bind to a `let` so the registry lock guard is dropped BEFORE
-                // the `.await`s in the arms below (a guard held across an await
-                // would make the future non-Send).
-                let attach_result = registry.lock().unwrap().attach(&session_id, client_id.clone());
+                // Reap finished sessions, then attach to the live one.
+                let attach_result = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.reap_exited();
+                    reg.attach(&session_id, client_id.clone())
+                };
                 match attach_result {
                     Ok(handle) => {
                         // Stop forwarding from any previously-attached session.
@@ -330,6 +353,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                             h.abort();
                         }
                         attached = Some(session_id.clone());
+                        let fw_id = session_id.clone();
                         send_frame(
                             &writer_tx,
                             DaemonToClient::Attached {
@@ -339,7 +363,11 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         )
                         .await?;
                         // Stream incremental output from this session to the client.
-                        forwarder = Some(spawn_output_forwarder(writer_tx.clone(), handle.receiver));
+                        forwarder = Some(spawn_output_forwarder(
+                            writer_tx.clone(),
+                            fw_id,
+                            handle.receiver,
+                        ));
                     }
                     Err(e) => {
                         let _ = send_frame(
@@ -361,6 +389,9 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 let argv = cmd.as_deref().map(split_command);
                 let created = {
                     let mut reg = registry.lock().unwrap();
+                    // A finished session is gone: drop it so set_name re-creates
+                    // fresh rather than resurrecting a zombie.
+                    reg.reap_exited();
                     if reg.contains(&session_id) {
                         Ok(())
                     } else {
@@ -377,13 +408,18 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                     .await;
                     continue;
                 }
-                let attach_result = registry.lock().unwrap().attach(&session_id, client_id.clone());
+                let attach_result = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.reap_exited();
+                    reg.attach(&session_id, client_id.clone())
+                };
                 match attach_result {
                     Ok(handle) => {
                         if let Some(h) = forwarder.take() {
                             h.abort();
                         }
                         attached = Some(session_id.clone());
+                        let fw_id = session_id.clone();
                         send_frame(
                             &writer_tx,
                             DaemonToClient::Attached {
@@ -392,7 +428,11 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                             },
                         )
                         .await?;
-                        forwarder = Some(spawn_output_forwarder(writer_tx.clone(), handle.receiver));
+                        forwarder = Some(spawn_output_forwarder(
+                            writer_tx.clone(),
+                            fw_id,
+                            handle.receiver,
+                        ));
                     }
                     Err(e) => {
                         let _ = send_frame(
@@ -517,9 +557,11 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
 }
 
 /// Stream a session's broadcast `Output` events to the writer channel until the
-/// session exits or the client goes away.
+/// session exits or the client goes away. On session exit it sends an [`Exit`]
+/// frame so the client can close its view instead of lingering in raw mode.
 fn spawn_output_forwarder(
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    session_id: String,
     mut receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -532,9 +574,18 @@ fn spawn_output_forwarder(
                         }
                     }
                 }
-                // The session exited; there is no explicit "exit" frame in the
-                // protocol, so the forwarding stream simply ends.
-                Ok(SessionEvent::Exit(_)) => break,
+                // The session's child exited: tell the client so its proxy closes
+                // instead of staying attached to a dead shell.
+                Ok(SessionEvent::Exit(_)) => {
+                    if let Ok(frame) = (DaemonToClient::Exit {
+                        session_id: session_id.clone(),
+                    })
+                    .to_frame()
+                    {
+                        let _ = writer_tx.send(frame);
+                    }
+                    break;
+                }
                 // We fell behind (many output chunks). Skip the gap and keep up.
                 Err(BroadcastRecvError::Lagged(_)) => continue,
                 Err(BroadcastRecvError::Closed) => break,
