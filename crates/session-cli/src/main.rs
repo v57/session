@@ -59,6 +59,8 @@ enum Command {
     Attach { id: String },
     /// `session <uuid> [cmd...]`
     AttachOrCreate { id: String, cmd: Option<String> },
+    /// Help request (-h / --help / help).
+    Help,
     /// No recognizable command (usage).
     Usage,
 }
@@ -82,6 +84,10 @@ fn main() -> ExitCode {
     };
 
     match parse_command(&rest) {
+        Command::Help => {
+            print_usage(&prog);
+            ExitCode::SUCCESS
+        }
         Command::Usage => {
             print_usage(&prog);
             ExitCode::from(EXIT_USAGE)
@@ -123,6 +129,7 @@ fn parse_command(rest: &[String]) -> Command {
     };
     match cmd.as_str() {
         "--daemon" => Command::Daemon,
+        "-h" | "--help" | "help" => Command::Help,
         "list" => Command::List,
         "kill" => match rest.get(1) {
             Some(id) => Command::Kill { id: id.clone() },
@@ -137,6 +144,8 @@ fn parse_command(rest: &[String]) -> Command {
             Some(id) => Command::Attach { id: id.clone() },
             None => Command::Usage,
         },
+        // An unrecognized leading flag is a usage error, NOT a session id.
+        _ if cmd.starts_with('-') => Command::Usage,
         // `session <uuid> [cmd...]` -> attach-or-create, optionally with a command.
         _ => Command::AttachOrCreate {
             id: cmd.clone(),
@@ -351,6 +360,19 @@ mod tests {
     #[test]
     fn no_args_is_usage() {
         assert_eq!(parse_command(&[]), Command::Usage);
+    }
+
+    #[test]
+    fn help_flags_are_help() {
+        assert_eq!(parse_command(&[s("-h")]), Command::Help);
+        assert_eq!(parse_command(&[s("--help")]), Command::Help);
+        assert_eq!(parse_command(&[s("help")]), Command::Help);
+    }
+
+    #[test]
+    fn unknown_leading_flag_is_usage_not_a_session_id() {
+        assert_eq!(parse_command(&[s("--foo")]), Command::Usage);
+        assert_eq!(parse_command(&[s("-x")]), Command::Usage);
     }
 
     #[test]
