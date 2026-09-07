@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod config;
+pub mod cwd;
 pub mod daemon;
 pub mod emulator;
 pub mod protocol;

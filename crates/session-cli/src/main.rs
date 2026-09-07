@@ -13,6 +13,7 @@
 //! * `session kill <uuid>`     -> kill one session (by id).
 //! * `session kill-all`        -> kill every session.
 //! * `session detach`          -> send a detach on the management channel.
+//! * `session -d <name>`       -> print the session's current working directory.
 //! * `session attach <uuid>`   -> attach to an existing session.
 //! * `session <name>`          -> attach, or create-if-absent, then attach.
 //! * `session <name> <cmd...>` -> start that named session running `cmd`, then
@@ -52,6 +53,8 @@ enum Command {
     Kill { id: String },
     /// `session kill-all`
     KillAll,
+    /// `session -d <name>` — print the session's working directory.
+    Cwd { name: String },
     /// `session detach`
     Detach,
     /// `session attach <uuid>` (attach to an existing session)
@@ -96,6 +99,7 @@ fn main() -> ExitCode {
         Command::List => rt.block_on(cmd_list()),
         Command::Kill { id } => rt.block_on(cmd_kill(id)),
         Command::KillAll => rt.block_on(cmd_kill_all()),
+        Command::Cwd { name } => rt.block_on(cmd_cwd(name)),
         Command::Detach => rt.block_on(cmd_detach()),
         // The attach subcommands route to the raw-mode proxy. `proxy::attach` is a
         // self-contained, sync entry point that builds its OWN runtime, so it must
@@ -134,6 +138,11 @@ fn parse_command(rest: &[String]) -> Command {
             None => Command::Usage,
         },
         "kill-all" => Command::KillAll,
+        // `-d <name>` prints the session's working directory.
+        "-d" => match rest.get(1) {
+            Some(name) => Command::Cwd { name: name.clone() },
+            None => Command::Usage,
+        },
         "detach" => Command::Detach,
         // `create` is intentionally NOT a command. Sessions are started with
         // `session <name> [cmd...]`. Reserve it so a stray `session create`
@@ -170,6 +179,7 @@ fn print_usage(prog: &str) {
     eprintln!("  kill <uuid>                kill a session by id");
     eprintln!("  kill-all                   kill every session");
     eprintln!("  detach                     detach the current client (if any)");
+    eprintln!("  -d <name>                  print the session's working directory");
     eprintln!("  attach <uuid>              attach to an existing session");
     eprintln!("  <name> [cmd...]            attach-or-create; cmd runs if the name is new");
     eprintln!("  --daemon                   run the session daemon loop");
@@ -294,6 +304,42 @@ async fn cmd_kill_all() -> ExitCode {
     }
 }
 
+/// `session -d <name>` — print the session's current working directory.
+async fn cmd_cwd(name: String) -> ExitCode {
+    let mut client = match connect_client().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("session: {e}");
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    if let Err(e) = client.send(ClientToDaemon::Cwd { session_id: name }).await {
+        eprintln!("session: failed to request cwd: {e}");
+        return ExitCode::from(EXIT_ERROR);
+    }
+    loop {
+        match client.recv().await {
+            Ok(Some(DaemonToClient::Cwd { cwd, .. })) => {
+                println!("{cwd}");
+                return ExitCode::SUCCESS;
+            }
+            Ok(Some(DaemonToClient::Error { message })) => {
+                eprintln!("session: {message}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("session: daemon closed the connection");
+                return ExitCode::from(EXIT_ERROR);
+            }
+            Err(e) => {
+                eprintln!("session: {e}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+        }
+    }
+}
+
 /// `session detach` — send a detach on the management channel (a detach with no
 /// attachment is a daemon-side no-op).
 async fn cmd_detach() -> ExitCode {
@@ -402,6 +448,12 @@ mod tests {
     fn kill_all_and_detach() {
         assert_eq!(parse_command(&[s("kill-all")]), Command::KillAll);
         assert_eq!(parse_command(&[s("detach")]), Command::Detach);
+    }
+
+    #[test]
+    fn dash_d_prints_cwd() {
+        assert_eq!(parse_command(&[s("-d"), s("myname")]), Command::Cwd { name: s("myname") });
+        assert_eq!(parse_command(&[s("-d")]), Command::Usage);
     }
 
     #[test]

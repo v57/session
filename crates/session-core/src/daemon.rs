@@ -290,6 +290,34 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 send_frame(&writer_tx, DaemonToClient::Listing { sessions }).await?;
             }
 
+            ClientToDaemon::Cwd { session_id } => {
+                let result = registry
+                    .lock()
+                    .unwrap()
+                    .find(&session_id)
+                    .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))
+                    .and_then(|s| {
+                        let pid = s
+                            .process_id()
+                            .ok_or_else(|| anyhow::anyhow!("session has no process id"))?;
+                        let cwd = crate::cwd::process_cwd(pid)
+                            .ok_or_else(|| anyhow::anyhow!("could not read cwd for pid {pid}"))?;
+                        Ok(cwd.to_string_lossy().into_owned())
+                    });
+                match result {
+                    Ok(cwd) => {
+                        send_frame(&writer_tx, DaemonToClient::Cwd { session_id, cwd }).await?
+                    }
+                    Err(e) => {
+                        let _ = send_frame(
+                            &writer_tx,
+                            DaemonToClient::Error { message: e.to_string() },
+                        )
+                        .await;
+                    }
+                }
+            }
+
             ClientToDaemon::Attach { session_id } => {
                 // Bind to a `let` so the registry lock guard is dropped BEFORE
                 // the `.await`s in the arms below (a guard held across an await
@@ -865,6 +893,82 @@ mod tests {
                 assert_eq!(sessions[0].id, "work-session");
             }
             other => panic!("expected Listing, got {other:?}"),
+        }
+
+        daemon.abort();
+    }
+
+    // GATE for the cwd RPC: after creating a session, `Cwd` returns the session
+    // child's live working directory (the daemon's inherited cwd, absolute).
+    #[tokio::test]
+    async fn cwd_reports_session_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_in(dir.path());
+        let daemon = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        let stream = connect_with_retry(&dir.path().join("session.sock")).await;
+        let mut r = BufReader::new(stream);
+        r.get_mut()
+            .write_all(
+                &(ClientToDaemon::Hello {
+                    version: PROTOCOL_VERSION,
+                })
+                .to_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            DaemonToClient::from_frame(line.as_bytes()).unwrap(),
+            DaemonToClient::Hello { .. }
+        ));
+
+        // Create a silent long-lived session.
+        r.get_mut()
+            .write_all(
+                &(ClientToDaemon::AttachCreate {
+                    session_id: "cwd-test".into(),
+                    cmd: Some("sleep 30".into()),
+                })
+                .to_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        line.clear();
+        r.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            DaemonToClient::from_frame(line.as_bytes()).unwrap(),
+            DaemonToClient::Attached { .. }
+        ));
+
+        // Ask for its cwd.
+        r.get_mut()
+            .write_all(
+                &(ClientToDaemon::Cwd {
+                    session_id: "cwd-test".into(),
+                })
+                .to_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        line.clear();
+        r.read_line(&mut line).await.unwrap();
+        match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
+            DaemonToClient::Cwd { session_id, cwd } => {
+                assert_eq!(session_id, "cwd-test");
+                assert!(!cwd.is_empty(), "cwd should not be empty");
+                assert!(
+                    std::path::Path::new(&cwd).is_absolute(),
+                    "cwd should be absolute: {cwd}"
+                );
+            }
+            other => panic!("expected Cwd, got {other:?}"),
         }
 
         daemon.abort();

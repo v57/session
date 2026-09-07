@@ -49,6 +49,9 @@ pub enum ClientToDaemon {
     Kill { session_id: String },
     /// Client requests that all sessions be killed.
     KillAll,
+    /// Client requests the working directory of a session (the Shell app uses
+    /// this to follow the shell's `cd` for file-drop / file-manager mode).
+    Cwd { session_id: String },
 }
 
 /// A frame from the daemon back to a client.
@@ -77,6 +80,8 @@ pub enum DaemonToClient {
     Listing { sessions: Vec<SessionInfo> },
     /// An error for the preceding request.
     Error { message: String },
+    /// The requested session's current working directory.
+    Cwd { session_id: String, cwd: String },
 }
 
 /// Metadata about one live session, as reported by [`DaemonToClient::Listing`].
@@ -325,6 +330,9 @@ mod tests {
             session_id: "s9".into(),
         });
         roundtrip_frame(&ClientToDaemon::KillAll);
+        roundtrip_frame(&ClientToDaemon::Cwd {
+            session_id: "s5".into(),
+        });
     }
 
     #[test]
@@ -354,6 +362,10 @@ mod tests {
         });
         roundtrip_frame(&DaemonToClient::Error {
             message: "no such session".into(),
+        });
+        roundtrip_frame(&DaemonToClient::Cwd {
+            session_id: "s5".into(),
+            cwd: "/Users/v57/projects".into(),
         });
     }
 

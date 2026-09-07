@@ -93,6 +93,8 @@ pub struct Session {
     id: String,
     create_time: SystemTime,
     title: String,
+    /// The child's OS process id, captured at spawn (used to query the live cwd).
+    process_id: Option<u32>,
     /// Shared with the pump task; guards are held only for non-awaiting work.
     emulator: Arc<StdMutex<Emulator>>,
     /// Source of every [`broadcast::Receiver`] handed out on attach/subscribe.
@@ -119,6 +121,8 @@ impl Session {
         scrollback_cap: usize,
     ) -> anyhow::Result<Self> {
         let pty = Pty::spawn(argv.clone())?;
+        // Capture the pid before the pty is moved into the pump task.
+        let pid = pty.process_id();
         // Seed the emulator at the pty's current size so replay is dimensionally
         // correct before the primary client reports its own (by then
         // `set_size` re-flows).
@@ -145,6 +149,7 @@ impl Session {
             id: name.to_string(),
             create_time: SystemTime::now(),
             title: make_title(argv),
+            process_id: pid,
             emulator,
             broadcast,
             cmd_tx,
@@ -157,6 +162,12 @@ impl Session {
     /// The session's unique id.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The child's OS process id, if the system reported one. Used by the daemon
+    /// to query the session's live cwd (and other process state).
+    pub fn process_id(&self) -> Option<u32> {
+        self.process_id
     }
 
     /// When the session was created.
