@@ -4,9 +4,10 @@
 //! spawn-time cwd captured in [`crate::pty::Pty`] is frozen at launch. So the
 //! daemon queries the OS for the child pid's cwd on demand via `process_cwd`.
 //!
-//! No extra dependency: Linux reads `/proc/<pid>/cwd`, macOS shells out to the
-//! system `lsof -d cwd -p <pid> -Fn`, and Windows is stubbed (returns `None`)
-//! until an implementation lands.
+//! No dependency on macOS/Linux: Linux reads `/proc/<pid>/cwd`, macOS shells
+//! out to the system `lsof -d cwd -p <pid> -Fn`. Windows uses the `sysinfo`
+//! crate (a Windows-only target dependency), whose `Process::cwd()` has been
+//! supported since 0.20.2.
 
 use std::path::PathBuf;
 
@@ -23,14 +24,26 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = pid;
-        None
+        windows_sysinfo_cwd(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = pid;
         None
     }
+}
+
+/// Windows: `sysinfo`'s `Process::cwd()`. `refresh_processes()` then a lookup
+/// by pid; returns `None` for pids we cannot read (e.g. a terminated process).
+#[cfg(target_os = "windows")]
+fn windows_sysinfo_cwd(pid: u32) -> Option<PathBuf> {
+    use sysinfo::{Pid, System};
+
+    let mut sys = System::new();
+    sys.refresh_processes();
+    sys.process(Pid::from_u32(pid))
+        .and_then(|p| p.cwd())
+        .map(|p| p.to_path_buf())
 }
 
 /// macOS: `lsof -a -d cwd -p <pid> -Fn` and parse the `n<path>` line.

@@ -25,3 +25,9 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Windows-only: sysinfo provides a process's current working directory (added in
+# 0.20.2). macOS uses `lsof` and Linux uses `/proc/PID/cwd` (both dependency-free),
+# so sysinfo is pulled for Windows builds only and never bloats macOS/Linux.
+[target.'cfg(windows)'.dependencies]
+sysinfo = "0.35"
