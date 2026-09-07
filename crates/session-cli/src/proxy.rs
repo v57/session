@@ -182,18 +182,22 @@ fn is_rich_term(term: &str) -> bool {
 
 /// Build the attach/create frame for a proxy run.
 ///
-/// A custom command is wrapped with `env TERM=<term> ...` so the daemon-spawned
-/// child inherits a truecolor-capable `TERM` (the daemon's own environment is not
-/// reachable from here). `term == None` leaves the command untouched.
-fn attach_frame(session: &str, cmd: Option<&str>, term: Option<&str>) -> ClientToDaemon {
-    match cmd {
-        Some(c) => ClientToDaemon::AttachCreate {
+/// `create == true` sends `AttachCreate` (create the session if absent, running
+/// `cmd` or the default shell when `cmd` is `None`) — this is `session <name>`
+/// and `session <name> <cmd>`. `create == false` sends a plain `Attach` (the
+/// session must already exist) — this is `session attach <name>`. A custom
+/// command is wrapped with `env TERM=<term> ...` so the daemon-spawned child
+/// inherits a truecolor-capable `TERM`; `term == None` leaves the command as-is.
+fn attach_frame(session: &str, cmd: Option<&str>, term: Option<&str>, create: bool) -> ClientToDaemon {
+    if create {
+        ClientToDaemon::AttachCreate {
             session_id: session.to_string(),
-            cmd: Some(with_term_prefix(c, term)),
-        },
-        None => ClientToDaemon::Attach {
+            cmd: cmd.map(|c| with_term_prefix(c, term)),
+        }
+    } else {
+        ClientToDaemon::Attach {
             session_id: session.to_string(),
-        },
+        }
     }
 }
 
@@ -222,6 +226,7 @@ pub fn attach(
     config: &Config,
     session: &str,
     cmd: Option<&str>,
+    create: bool,
     opts: ProxyOptions,
 ) -> anyhow::Result<ProxyExit> {
     // Best-effort: expose a rich TERM in this process's own environment too, so
@@ -254,7 +259,7 @@ pub fn attach(
 
         // The attach (or create-attach) frame; a custom command may carry the
         // TERM prefix so the daemon-spawned child sees a truecolor terminal.
-        let frame = attach_frame(session, cmd, opts.term.as_deref());
+        let frame = attach_frame(session, cmd, opts.term.as_deref(), create);
 
         if opts.raw_mode {
             if let Err(e) = crossterm::terminal::enable_raw_mode() {
@@ -668,7 +673,7 @@ mod tests {
 
     #[test]
     fn attach_frame_wraps_custom_cmd_with_rich_term() {
-        let frame = attach_frame("s1", Some("vim"), Some("xterm-256color"));
+        let frame = attach_frame("s1", Some("vim"), Some("xterm-256color"), true);
         assert_eq!(
             frame,
             ClientToDaemon::AttachCreate {
@@ -680,7 +685,7 @@ mod tests {
 
     #[test]
     fn attach_frame_without_term_leaves_cmd_untouched() {
-        let frame = attach_frame("s1", Some("vim"), None);
+        let frame = attach_frame("s1", Some("vim"), None, true);
         assert_eq!(
             frame,
             ClientToDaemon::AttachCreate {
@@ -688,10 +693,19 @@ mod tests {
                 cmd: Some("vim".to_string()),
             }
         );
-        // Attach (no command) is unaffected by TERM.
+        // create=false (explicit `session attach`) is unaffected by TERM.
         assert_eq!(
-            attach_frame("s1", None, Some("xterm-256color")),
+            attach_frame("s1", None, Some("xterm-256color"), false),
             ClientToDaemon::Attach { session_id: "s1".to_string() }
+        );
+        // create=true with a bare name sends AttachCreate{None}, so `session
+        // <name>` creates a default-shell session when the name is new.
+        assert_eq!(
+            attach_frame("s1", None, Some("xterm-256color"), true),
+            ClientToDaemon::AttachCreate {
+                session_id: "s1".to_string(),
+                cmd: None
+            }
         );
     }
 

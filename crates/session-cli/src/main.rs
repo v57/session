@@ -104,9 +104,9 @@ fn main() -> ExitCode {
         // The attach subcommands route to the raw-mode proxy. `proxy::attach` is a
         // self-contained, sync entry point that builds its OWN runtime, so it must
         // NOT be called from inside `rt.block_on` (that would nest a runtime).
-        Command::Attach { id } => run_attach_sync(&Config::load(), &id, None),
+        Command::Attach { id } => run_attach_sync(&Config::load(), &id, None, false),
         Command::AttachOrCreate { id, cmd } => {
-            run_attach_sync(&Config::load(), &id, cmd.as_deref())
+            run_attach_sync(&Config::load(), &id, cmd.as_deref(), true)
         }
     }
 }
@@ -358,7 +358,7 @@ async fn cmd_detach() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Route an attach-or-create subcommand to the raw-mode byte proxy.
+/// Route an attach subcommand to the raw-mode byte proxy.
 ///
 /// This is a *sync* entry point because [`proxy::attach`] builds its OWN tokio
 /// runtime internally; calling it from inside the outer runtime's `block_on`
@@ -366,7 +366,7 @@ async fn cmd_detach() -> ExitCode {
 /// runtime that is dropped BEFORE `proxy::attach` is called, so the daemon is up
 /// and the proxy sees a listener. The daemon and session always survive the
 /// client detaching.
-fn run_attach_sync(cfg: &Config, session: &str, cmd: Option<&str>) -> ExitCode {
+fn run_attach_sync(cfg: &Config, session: &str, cmd: Option<&str>, create: bool) -> ExitCode {
     // Auto-start the daemon (spawns a detached `session --daemon`) so the proxy's
     // `Conn::connect` finds a listener. The temporary runtime is dropped before
     // `proxy::attach` creates its own.
@@ -384,7 +384,7 @@ fn run_attach_sync(cfg: &Config, session: &str, cmd: Option<&str>) -> ExitCode {
         }
     }
 
-    match proxy::attach(cfg, session, cmd, proxy::ProxyOptions::default()) {
+    match proxy::attach(cfg, session, cmd, create, proxy::ProxyOptions::default()) {
         Ok(_exit) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("session: {e}");
