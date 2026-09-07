@@ -319,43 +319,52 @@ where
         )
         .await?;
 
-    // Daemon -> stdout: the surrounding terminal renders the bytes.
-    let (done_tx, mut done_rx) = oneshot::channel::<()>();
+    // Daemon -> stdout: the surrounding terminal renders the bytes. The reader
+    // reports its outcome (a fatal daemon Error becomes an error result) through
+    // `done_rx` so the main loop can stop forwarding and exit cleanly.
+    let (done_tx, mut done_rx) = oneshot::channel::<anyhow::Result<()>>();
     let reader_task = tokio::spawn(async move {
         let mut reader = reader;
         let mut stdout = stdout;
         let result = forward_daemon_to_stdout(&mut reader, &mut stdout).await;
-        let _ = done_tx.send(());
-        result
+        let _ = done_tx.send(result);
     });
 
     // stdin -> daemon, plus resize / terminate.
     let mut buf = [0u8; 4096];
-    let outcome = loop {
+    let outcome: anyhow::Result<ProxyExit> = loop {
         tokio::select! {
             n = stdin.read(&mut buf) => match n {
-                Ok(0) => break ProxyExit::Detached,            // stdin EOF -> detach
+                Ok(0) => break Ok(ProxyExit::Detached),            // stdin EOF -> detach
                 Ok(n) => {
                     let frame = ClientToDaemon::Input { bytes: buf[..n].to_vec() };
                     if writer.write_all(&frame.to_frame()?).await.is_err() {
-                        break ProxyExit::Detached;
+                        break Ok(ProxyExit::Detached);
                     }
                 }
                 Err(e) => {
                     eprintln!("session: stdin error: {e}");
-                    break ProxyExit::Detached;
+                    break Ok(ProxyExit::Detached);
                 }
             },
             size = resize_rx.recv() => {
                 if let Some((rows, cols)) = size {
                     let frame = ClientToDaemon::Resize { rows, cols };
                     if writer.write_all(&frame.to_frame()?).await.is_err() {
-                        break ProxyExit::Detached;
+                        break Ok(ProxyExit::Detached);
                     }
                 }
             }
-            _ = term_rx.recv() => break ProxyExit::Detached,   // SIGTERM -> detach
-            _ = &mut done_rx => break ProxyExit::Closed,       // daemon closed / session ended
+            _ = term_rx.recv() => break Ok(ProxyExit::Detached),   // SIGTERM -> detach
+            res = &mut done_rx => break match res {
+                // The daemon ended the stream cleanly (session ended / daemon exit).
+                Ok(Ok(())) => Ok(ProxyExit::Closed),
+                // The daemon reported a fatal Error (attach failed, broken state):
+                // surface it so the proxy exits with a real error, not a raw-mode hang.
+                Ok(Err(e)) => Err(e),
+                // The sender was dropped (we aborted the reader task).
+                Err(_) => Ok(ProxyExit::Closed),
+            },
         }
     };
 
@@ -363,7 +372,7 @@ where
     // the session. If the daemon already closed, this is a harmless no-op error.
     let _ = writer.write_all(&ClientToDaemon::Detach.to_frame()?).await;
     reader_task.abort();
-    Ok(outcome)
+    outcome
 }
 
 /// Read daemon frames and write their raw payloads to `stdout`.
@@ -395,7 +404,11 @@ where
                 stdout.write_all(&bytes).await?;
                 stdout.flush().await?;
             }
-            DaemonToClient::Error { message } => eprintln!("session: {message}"),
+            // A daemon Error frame is fatal: it means the attach/create failed
+            // (e.g. "no such session") or the session is in a broken state. Bail
+            // so the proxy exits with a real error instead of staying in raw mode
+            // and forwarding keystrokes into a session it isn't attached to.
+            DaemonToClient::Error { message } => return Err(anyhow::anyhow!(message)),
             DaemonToClient::Killed { session_id } => {
                 eprintln!("session: session {session_id} was killed")
             }
@@ -706,6 +719,23 @@ mod tests {
                 session_id: "s1".to_string(),
                 cmd: None
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_daemon_error_is_fatal() {
+        // A daemon Error frame (e.g. "no such session") must make the forwarder
+        // bail, not keep printing and leave the proxy stuck in raw mode.
+        let frame = DaemonToClient::Error {
+            message: "no such session: test".into(),
+        }
+        .to_frame()
+        .unwrap();
+        let mut reader = BufReader::new(&frame[..]);
+        let res = forward_daemon_to_stdout(&mut reader, &mut tokio::io::sink()).await;
+        assert!(
+            res.is_err(),
+            "a daemon Error frame must be fatal, not swallowed"
         );
     }
 
