@@ -13,10 +13,11 @@
 //! * `session kill <uuid>`     -> kill one session (by id).
 //! * `session kill-all`        -> kill every session.
 //! * `session detach`          -> send a detach on the management channel.
-//! * `session create [cmd...]` -> create a session (running `cmd`) and attach.
 //! * `session attach <uuid>`   -> attach to an existing session.
-//! * `session <uuid>`          -> attach, or create-if-absent, then attach.
-//! * `session <uuid> <cmd...>` -> create a session running `cmd`, then attach.
+//! * `session <name>`          -> attach, or create-if-absent, then attach.
+//! * `session <name> <cmd...>` -> start that named session running `cmd`, then
+//!                                attach; if the name is already live, `cmd` is
+//!                                ignored (resume).
 //! * `session --daemon`        -> run the daemon loop (via session-core).
 //!
 //! The management subcommands (list/kill/kill-all/detach) route to the
@@ -53,8 +54,6 @@ enum Command {
     KillAll,
     /// `session detach`
     Detach,
-    /// `session create [cmd...]`
-    Create { cmd: Option<String> },
     /// `session attach <uuid>` (attach to an existing session)
     Attach { id: String },
     /// `session <uuid> [cmd...]`
@@ -101,7 +100,6 @@ fn main() -> ExitCode {
         // The attach subcommands route to the raw-mode proxy. `proxy::attach` is a
         // self-contained, sync entry point that builds its OWN runtime, so it must
         // NOT be called from inside `rt.block_on` (that would nest a runtime).
-        Command::Create { cmd } => run_attach_sync(&Config::load(), "", cmd.as_deref()),
         Command::Attach { id } => run_attach_sync(&Config::load(), &id, None),
         Command::AttachOrCreate { id, cmd } => {
             run_attach_sync(&Config::load(), &id, cmd.as_deref())
@@ -137,9 +135,10 @@ fn parse_command(rest: &[String]) -> Command {
         },
         "kill-all" => Command::KillAll,
         "detach" => Command::Detach,
-        "create" => Command::Create {
-            cmd: join_cmd(&rest[1..]),
-        },
+        // `create` is intentionally NOT a command. Sessions are started with
+        // `session <name> [cmd...]`. Reserve it so a stray `session create`
+        // is a usage error instead of silently creating a session named "create".
+        "create" => Command::Usage,
         "attach" => match rest.get(1) {
             Some(id) => Command::Attach { id: id.clone() },
             None => Command::Usage,
@@ -171,9 +170,8 @@ fn print_usage(prog: &str) {
     eprintln!("  kill <uuid>                kill a session by id");
     eprintln!("  kill-all                   kill every session");
     eprintln!("  detach                     detach the current client (if any)");
-    eprintln!("  create [cmd...]            create a session and attach");
     eprintln!("  attach <uuid>              attach to an existing session");
-    eprintln!("  <uuid> [cmd...]            attach, or create-if-absent, then attach");
+    eprintln!("  <name> [cmd...]            attach-or-create; cmd runs if the name is new");
     eprintln!("  --daemon                   run the session daemon loop");
 }
 
@@ -395,6 +393,12 @@ mod tests {
     }
 
     #[test]
+    fn create_is_not_a_command() {
+        assert_eq!(parse_command(&[s("create")]), Command::Usage);
+        assert_eq!(parse_command(&[s("create"), s("myname")]), Command::Usage);
+    }
+
+    #[test]
     fn kill_all_and_detach() {
         assert_eq!(parse_command(&[s("kill-all")]), Command::KillAll);
         assert_eq!(parse_command(&[s("detach")]), Command::Detach);
@@ -409,16 +413,6 @@ mod tests {
         assert_eq!(parse_command(&[s("attach")]), Command::Usage);
     }
 
-    #[test]
-    fn create_with_and_without_cmd() {
-        assert_eq!(
-            parse_command(&[s("create"), s("vim"), s("file")]),
-            Command::Create {
-                cmd: Some(s("vim file"))
-            }
-        );
-        assert_eq!(parse_command(&[s("create")]), Command::Create { cmd: None });
-    }
 
     #[test]
     fn uuid_with_cmd_is_attach_or_create_with_cmd() {
