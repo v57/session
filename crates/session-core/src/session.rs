@@ -164,6 +164,13 @@ impl Session {
         &self.id
     }
 
+    /// Change the session's id (used by rename; the registry key moves too).
+    /// Safe only while no client is attached — attached connections bind to
+    /// the name they attached with, so `Registry::rename` refuses that case.
+    pub fn set_id(&mut self, id: impl Into<String>) {
+        self.id = id.into();
+    }
+
     /// The child's OS process id, if the system reported one. Used by the daemon
     /// to query the session's live cwd (and other process state).
     pub fn process_id(&self) -> Option<u32> {

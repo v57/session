@@ -1,10 +1,12 @@
 //! Session registry: the daemon's map of live sessions, plus the
-//! create/find/kill/list lifecycle.
+//! create/find/rename/kill/list lifecycle.
 //!
-//! The registry owns the `HashMap<Uuid, Session>` that is the daemon's view of
-//! what exists. `kill`/`kill_all` terminate a session's child and drop it from
-//! the map so `list` no longer reports it (a session dropped here closes its
-//! command channel, which the pump treats as teardown and reaps the pty).
+//! The registry owns the `HashMap<String, Session>` that is the daemon's view
+//! of what exists — sessions are keyed by their caller-supplied NAME (the
+//! create-or-attach identity), not a uuid. `kill`/`kill_all` terminate a
+//! session's child and drop it from the map so `list` no longer reports it (a
+//! session dropped here closes its command channel, which the pump treats as
+//! teardown and reaps the pty).
 
 use crate::config::Config;
 use crate::session::{AttachHandle, ClientId, Session};
@@ -98,6 +100,38 @@ impl Registry {
         // Dropping the session closes its command channel, which the pump treats
         // as teardown and reaps the pty.
         self.sessions.remove(id);
+        Ok(())
+    }
+
+    /// Rename a live session (`from` -> `to`), moving the registry key and
+    /// updating the session's stored id so `list`/attach report the new name.
+    ///
+    /// Refused when `from` is unknown, `to` is already live, or the session
+    /// has attached clients (every attached connection binds to the name it
+    /// attached with — renaming under an attached client would strand that
+    /// client's input routing, so it must detach first). Renaming a session
+    /// to itself is a no-op.
+    pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        if !self.sessions.contains_key(from) {
+            return Err(anyhow::anyhow!("no such session: {from}"));
+        }
+        if self.sessions.contains_key(to) {
+            return Err(anyhow::anyhow!("a session named '{to}' already exists"));
+        }
+        if self.sessions.get(from).is_some_and(|s| s.attached() > 0) {
+            return Err(anyhow::anyhow!(
+                "session '{from}' has attached clients; detach before renaming"
+            ));
+        }
+        let mut session = self
+            .sessions
+            .remove(from)
+            .expect("existence checked above");
+        session.set_id(to);
+        self.sessions.insert(to.to_string(), session);
         Ok(())
     }
 
@@ -244,6 +278,50 @@ mod tests {
     async fn kill_unknown_id_is_error() {
         let mut reg = Registry::new(2000);
         assert!(reg.kill("nope").is_err());
+    }
+
+    // Rename moves the registry key AND the session's stored id: the old name
+    // no longer resolves and `list` reports the new one.
+    #[tokio::test]
+    async fn rename_moves_session_identity() {
+        let mut reg = Registry::new(2000);
+        reg.create_session("old-name", None).expect("create session");
+
+        reg.rename("old-name", "new-name").expect("rename");
+        assert!(!reg.contains("old-name"));
+        assert!(reg.contains("new-name"));
+        assert_eq!(reg.find("new-name").expect("renamed session").id(), "new-name");
+        assert_eq!(reg.list()[0].id, "new-name");
+
+        // Renaming to the same name is a no-op success.
+        assert!(reg.rename("new-name", "new-name").is_ok());
+        reg.kill("new-name").expect("kill renamed session");
+    }
+
+    // Rename refuses an unknown source, a taken target, and an ATTACHED
+    // session (its client connections bind to the old name).
+    #[tokio::test]
+    async fn rename_rejects_unknown_taken_and_attached() {
+        let mut reg = Registry::new(2000);
+        assert!(reg.rename("nope", "x").is_err(), "unknown source");
+
+        reg.create_session("a", None).expect("create a");
+        reg.create_session("b", None).expect("create b");
+        assert!(reg.rename("a", "b").is_err(), "taken target");
+
+        // An attached client must detach through the session (dropping the
+        // AttachHandle only drops its broadcast receiver).
+        let client: crate::session::ClientId = "client-1".into();
+        let _handle = reg.attach("b", client.clone()).expect("attach b");
+        assert!(reg.rename("b", "c").is_err(), "attached session refuses rename");
+        reg.find_mut("b")
+            .expect("session b")
+            .detach(&client);
+        assert!(reg.rename("b", "c").is_ok(), "detached session renames");
+        assert!(reg.contains("c"));
+
+        reg.kill("a").expect("kill a");
+        reg.kill("c").expect("kill c");
     }
 
     // A session whose child process exits is reaped: `reap_exited` drops it so

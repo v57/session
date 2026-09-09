@@ -339,6 +339,31 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 }
             }
 
+            ClientToDaemon::Rename { from, to } => {
+                // Rename refuses attached sessions and taken names; the
+                // registry moves the key AND the session's stored id. Only a
+                // headless client issues rename (attach proxies never do), but
+                // keep this connection's own binding honest in case it ever
+                // renames the session it is attached to (daemon-side no-op).
+                let rename_result = registry.lock().unwrap().rename(&from, &to);
+                match rename_result {
+                    Ok(()) => {
+                        if attached.as_deref() == Some(from.as_str()) {
+                            attached = Some(to.clone());
+                        }
+                        send_frame(&writer_tx, DaemonToClient::Renamed { session_id: to })
+                            .await?;
+                    }
+                    Err(e) => {
+                        let _ = send_frame(
+                            &writer_tx,
+                            DaemonToClient::Error { message: e.to_string() },
+                        )
+                        .await;
+                    }
+                }
+            }
+
             ClientToDaemon::Attach { session_id } => {
                 // Reap finished sessions, then attach to the live one.
                 let attach_result = {

@@ -12,6 +12,7 @@
 //! * `session list`            -> JSON listing of live sessions.
 //! * `session kill <uuid>`     -> kill one session (by id).
 //! * `session kill-all`        -> kill every session.
+//! * `session rename <from> <to>` -> rename a live session (must be detached).
 //! * `session detach`          -> send a detach on the management channel.
 //! * `session -d <name>`       -> print the session's current working directory.
 //! * `session attach <uuid>`   -> attach to an existing session.
@@ -55,6 +56,8 @@ enum Command {
     KillAll,
     /// `session -d <name>` — print the session's working directory.
     Cwd { name: String },
+    /// `session rename <from> <to>` — rename a live session.
+    Rename { from: String, to: String },
     /// `session detach`
     Detach,
     /// `session attach <uuid>` (attach to an existing session)
@@ -100,6 +103,7 @@ fn main() -> ExitCode {
         Command::Kill { id } => rt.block_on(cmd_kill(id)),
         Command::KillAll => rt.block_on(cmd_kill_all()),
         Command::Cwd { name } => rt.block_on(cmd_cwd(name)),
+        Command::Rename { from, to } => rt.block_on(cmd_rename(from, to)),
         Command::Detach => rt.block_on(cmd_detach()),
         // The attach subcommands route to the raw-mode proxy. `proxy::attach` is a
         // self-contained, sync entry point that builds its OWN runtime, so it must
@@ -138,6 +142,14 @@ fn parse_command(rest: &[String]) -> Command {
             None => Command::Usage,
         },
         "kill-all" => Command::KillAll,
+        // `rename <from> <to>` renames a live session.
+        "rename" => match (rest.get(1), rest.get(2), rest.get(3)) {
+            (Some(from), Some(to), None) => Command::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            _ => Command::Usage,
+        },
         // `-d <name>` prints the session's working directory.
         "-d" => match rest.get(1) {
             Some(name) => Command::Cwd { name: name.clone() },
@@ -178,6 +190,7 @@ fn print_usage(prog: &str) {
     eprintln!("  list                       list live sessions as JSON");
     eprintln!("  kill <uuid>                kill a session by id");
     eprintln!("  kill-all                   kill every session");
+    eprintln!("  rename <from> <to>         rename a live session (must be detached)");
     eprintln!("  detach                     detach the current client (if any)");
     eprintln!("  -d <name>                  print the session's working directory");
     eprintln!("  attach <uuid>              attach to an existing session");
@@ -340,6 +353,50 @@ async fn cmd_cwd(name: String) -> ExitCode {
     }
 }
 
+/// `session rename <from> <to>` — rename a live session. The daemon refuses
+/// when the source is unknown, the target name is taken, or the session has
+/// attached clients; its error text is printed and exit is 1.
+async fn cmd_rename(from: String, to: String) -> ExitCode {
+    let mut client = match connect_client().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("session: {e}");
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    if let Err(e) = client
+        .send(ClientToDaemon::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        })
+        .await
+    {
+        eprintln!("session: failed to send rename: {e}");
+        return ExitCode::from(EXIT_ERROR);
+    }
+    loop {
+        match client.recv().await {
+            Ok(Some(DaemonToClient::Renamed { session_id })) => {
+                println!("session: renamed {from} to {session_id}");
+                return ExitCode::SUCCESS;
+            }
+            Ok(Some(DaemonToClient::Error { message })) => {
+                eprintln!("session: {message}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("session: daemon closed the connection");
+                return ExitCode::from(EXIT_ERROR);
+            }
+            Err(e) => {
+                eprintln!("session: {e}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+        }
+    }
+}
+
 /// `session detach` — send a detach on the management channel (a detach with no
 /// attachment is a daemon-side no-op).
 async fn cmd_detach() -> ExitCode {
@@ -448,6 +505,23 @@ mod tests {
     fn kill_all_and_detach() {
         assert_eq!(parse_command(&[s("kill-all")]), Command::KillAll);
         assert_eq!(parse_command(&[s("detach")]), Command::Detach);
+    }
+
+    #[test]
+    fn rename_requires_exactly_two_names() {
+        assert_eq!(
+            parse_command(&[s("rename"), s("old"), s("new")]),
+            Command::Rename {
+                from: s("old"),
+                to: s("new")
+            }
+        );
+        assert_eq!(parse_command(&[s("rename")]), Command::Usage);
+        assert_eq!(parse_command(&[s("rename"), s("only-one")]), Command::Usage);
+        assert_eq!(
+            parse_command(&[s("rename"), s("a"), s("b"), s("extra")]),
+            Command::Usage
+        );
     }
 
     #[test]

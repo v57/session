@@ -52,6 +52,12 @@ pub enum ClientToDaemon {
     Kill { session_id: String },
     /// Client requests that all sessions be killed.
     KillAll,
+    /// Client renames a live session (`from` -> `to`). Refused by the daemon
+    /// when `from` is unknown, `to` is already live, or the session has
+    /// attached clients (each client connection binds to the name it attached
+    /// with; renaming under an attached client would strand its input
+    /// routing). Headless — needs no TTY.
+    Rename { from: String, to: String },
     /// Client requests the working directory of a session (the Shell app uses
     /// this to follow the shell's `cd` for file-drop / file-manager mode).
     Cwd { session_id: String },
@@ -79,6 +85,8 @@ pub enum DaemonToClient {
     },
     /// The referenced session was killed.
     Killed { session_id: String },
+    /// A session was renamed; `session_id` is its NEW name.
+    Renamed { session_id: String },
     /// The referenced session's child process exited. The daemon is closing the
     /// session; an attached client should end its view instead of lingering.
     Exit { session_id: String },
@@ -336,6 +344,10 @@ mod tests {
             session_id: "s9".into(),
         });
         roundtrip_frame(&ClientToDaemon::KillAll);
+        roundtrip_frame(&ClientToDaemon::Rename {
+            from: "old".into(),
+            to: "new".into(),
+        });
         roundtrip_frame(&ClientToDaemon::Cwd {
             session_id: "s5".into(),
         });
@@ -355,6 +367,9 @@ mod tests {
         });
         roundtrip_frame(&DaemonToClient::Killed {
             session_id: "s9".into(),
+        });
+        roundtrip_frame(&DaemonToClient::Renamed {
+            session_id: "s10".into(),
         });
         roundtrip_frame(&DaemonToClient::Exit {
             session_id: "s9".into(),
