@@ -23,6 +23,7 @@
 use crate::client::{self, Client, ConnectError};
 use anyhow::{bail, Context, Result};
 use session_core::config::Config;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -49,22 +50,183 @@ impl DaemonSpawner for CommandSpawner {
     fn spawn(&self, _config: &Config) -> Result<()> {
         // `session --daemon` is this same binary ([[bin]] name = "session").
         let exe = std::env::current_exe().context("resolve own binary path")?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("--daemon")
-            // Sessions inherit the daemon's environment: never the password.
-            .env_remove(crate::password::ENV)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // Own process group: a SIGHUP delivered to the CLI's controlling
-            // terminal foreground group won't also kill the daemon.
-            cmd.process_group(0);
+            Command::new(exe)
+                .arg("--daemon")
+                // Sessions inherit the daemon's environment: never the password.
+                .env_remove(crate::password::ENV)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                // Own process group: a SIGHUP delivered to the CLI's controlling
+                // terminal foreground group won't also kill the daemon.
+                .process_group(0)
+                .spawn()
+                .context("spawn `session --daemon`")?;
         }
-        cmd.spawn().context("spawn `session --daemon`")?;
+        #[cfg(windows)]
+        windows::spawn_daemon(&exe).context("spawn `session --daemon`")?;
         Ok(())
+    }
+}
+
+/// Starting the daemon on Windows so it outlives whatever started it.
+///
+/// `std::process::Command` always lets the child inherit every inheritable
+/// handle of this process, not just the three it is given. A daemon holding,
+/// say, the pipe `session list` writes to, or an ssh session's channel, keeps
+/// it open for as long as it runs, so whoever waits for EOF (PowerShell, sshd,
+/// Shell's remote scan) waits forever. So the daemon is started with
+/// `CreateProcessW` directly: no inherited handles, no std handles at all.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        reserved2_len: u16,
+        reserved2: *mut u8,
+        std_input: Handle,
+        std_output: Handle,
+        std_error: Handle,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        process: Handle,
+        thread: Handle,
+        process_id: u32,
+        thread_id: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateProcessW(
+            application: *const u16,
+            command_line: *mut u16,
+            process_attributes: *const c_void,
+            thread_attributes: *const c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *const c_void,
+            current_directory: *const u16,
+            startup_info: *const StartupInfoW,
+            process_information: *mut ProcessInformation,
+        ) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    /// A console of its own, without a window: console APIs (ConPTY) work, and
+    /// closing the user's terminal, which sends CTRL_CLOSE_EVENT to everything
+    /// on its console, doesn't end the daemon.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    /// Ctrl+C in the user's terminal never reaches the daemon.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    /// Leave the job of an ssh session or terminal, which may kill its
+    /// processes when it ends. Not every job allows it, so it is tried first.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    pub fn spawn_daemon(exe: &Path) -> std::io::Result<()> {
+        let mut command_line = wide(OsStr::new(&format!("\"{}\" --daemon", exe.display())));
+        command_line.push(0);
+        let environment = environment_block();
+        let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+        let startup = StartupInfoW {
+            cb: std::mem::size_of::<StartupInfoW>() as u32,
+            reserved: std::ptr::null_mut(),
+            desktop: std::ptr::null_mut(),
+            title: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+            x_size: 0,
+            y_size: 0,
+            x_count_chars: 0,
+            y_count_chars: 0,
+            fill_attribute: 0,
+            flags: 0,
+            show_window: 0,
+            reserved2_len: 0,
+            reserved2: std::ptr::null_mut(),
+            std_input: std::ptr::null_mut(),
+            std_output: std::ptr::null_mut(),
+            std_error: std::ptr::null_mut(),
+        };
+        for flags in [flags | CREATE_BREAKAWAY_FROM_JOB, flags] {
+            let mut info = ProcessInformation {
+                process: std::ptr::null_mut(),
+                thread: std::ptr::null_mut(),
+                process_id: 0,
+                thread_id: 0,
+            };
+            // SAFETY: every pointer is valid for the call; CreateProcessW may
+            // write to `command_line`, which is a mutable NUL-terminated buffer.
+            let ok = unsafe {
+                CreateProcessW(
+                    std::ptr::null(),
+                    command_line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    flags,
+                    environment.as_ptr() as *const c_void,
+                    std::ptr::null(),
+                    &startup,
+                    &mut info,
+                )
+            };
+            if ok != 0 {
+                unsafe {
+                    CloseHandle(info.thread);
+                    CloseHandle(info.process);
+                }
+                return Ok(());
+            }
+        }
+        Err(std::io::Error::last_os_error())
+    }
+
+    /// This process's environment minus the session password, as a
+    /// CreateProcessW block: `NAME=value\0` entries, ended by another `\0`.
+    fn environment_block() -> Vec<u16> {
+        let mut block = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            if name.to_string_lossy().eq_ignore_ascii_case(crate::password::ENV) {
+                continue;
+            }
+            block.extend(wide(&name));
+            block.push(u16::from(b'='));
+            block.extend(wide(&value));
+            block.push(0);
+        }
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().collect()
     }
 }
 
