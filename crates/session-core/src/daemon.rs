@@ -22,10 +22,13 @@
 //!
 //! # Single-instance guard
 //!
-//! Before binding, the daemon probes the socket: if something is already
-//! listening AND answers a `Hello` handshake with a matching protocol version,
-//! another daemon is running on this socket — so this process exits without
-//! starting a second one. Otherwise (no socket, a corpse socket whose listener
+//! Before binding, the daemon takes an exclusive lock on a `.lock` file next to
+//! the socket and holds it for its lifetime; if the lock is held, another
+//! daemon owns this socket and this process exits. This makes probe-then-bind
+//! atomic against a concurrent start. The daemon then also probes the socket:
+//! if something is already listening AND answers a `Hello` handshake with a
+//! matching protocol version (a daemon from a build without the lock file),
+//! this process exits too. Otherwise (no socket, a corpse socket whose listener
 //! is gone, or a peer that doesn't speak the protocol) the daemon takes over
 //! and becomes the singleton owner.
 //!
@@ -111,8 +114,35 @@ pub async fn run(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.socket_dir)?;
     ensure_working_dir()?;
 
-    // Single-instance guard: if a live daemon already answers a Hello on this
-    // socket, we must NOT start a second one.
+    // Single-instance guard, part 1: an exclusive lock held for the daemon's
+    // whole lifetime. Two daemons racing to start (several clients auto-
+    // launching at once) can't both pass the probe below and then overwrite
+    // each other's socket; the loser exits here.
+    let lock_path = config.socket_path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| anyhow::anyhow!("cannot open lock file {}: {e}", lock_path.display()))?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            log::info!(
+                "session daemon already running (lock {} held); exiting",
+                lock_path.display()
+            );
+            return Ok(());
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(anyhow::anyhow!("cannot lock {}: {e}", lock_path.display()));
+        }
+    }
+    let _instance_lock = lock_file;
+
+    // Part 2: if a live daemon already answers a Hello on this socket (one
+    // started by a build that predates the lock file), we must NOT start a
+    // second one.
     if probe_alive(&config.socket_path).await? {
         log::info!(
             "session daemon already running on {}; exiting",
@@ -312,19 +342,25 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::Cwd { session_id } => {
-                let result = registry
+                // Only the pid lookup holds the registry lock. The cwd query
+                // itself can shell out (`lsof` on macOS), so it runs on the
+                // blocking pool instead of stalling every other connection.
+                let pid = registry
                     .lock()
                     .unwrap()
                     .find(&session_id)
                     .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))
                     .and_then(|s| {
-                        let pid = s
-                            .process_id()
-                            .ok_or_else(|| anyhow::anyhow!("session has no process id"))?;
-                        let cwd = crate::cwd::process_cwd(pid)
-                            .ok_or_else(|| anyhow::anyhow!("could not read cwd for pid {pid}"))?;
-                        Ok(cwd.to_string_lossy().into_owned())
+                        s.process_id()
+                            .ok_or_else(|| anyhow::anyhow!("session has no process id"))
                     });
+                let result = match pid {
+                    Ok(pid) => tokio::task::spawn_blocking(move || crate::cwd::process_cwd(pid))
+                        .await?
+                        .map(|cwd| cwd.to_string_lossy().into_owned())
+                        .ok_or_else(|| anyhow::anyhow!("could not read cwd for pid {pid}")),
+                    Err(e) => Err(e),
+                };
                 match result {
                     Ok(cwd) => {
                         send_frame(&writer_tx, DaemonToClient::Cwd { session_id, cwd }).await?
@@ -763,6 +799,24 @@ mod tests {
         assert!(second.is_ok(), "second daemon should exit Ok(()), got {second:?}");
 
         first.abort();
+    }
+
+    // The instance lock makes probe-then-bind atomic: while another daemon
+    // holds it, `run` must exit `Ok(())` without touching the socket (two
+    // racing daemons would otherwise both bind, the second unlinking the
+    // first's socket and orphaning its sessions).
+    #[tokio::test]
+    async fn held_instance_lock_makes_run_exit_without_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_in(dir.path());
+        let lock = std::fs::File::create(cfg.socket_path.with_extension("lock")).unwrap();
+        lock.try_lock().unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run(cfg.clone()))
+            .await
+            .expect("run must return promptly while the lock is held");
+        assert!(result.is_ok(), "lock holder present -> exit Ok(()), got {result:?}");
+        assert!(!cfg.socket_path.exists(), "must not bind while the lock is held");
     }
 
     // Round-trip: create a session, attach, feed input, and observe the child's
