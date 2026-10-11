@@ -193,7 +193,7 @@ impl Grid {
     /// the remainder down; rows that overflow `bottom` are dropped.
     pub fn insert_lines(&mut self, top: usize, bottom: usize, row: usize, n: usize) {
         let bottom = bottom.min(self.rows.saturating_sub(1));
-        let row = row.clamp(top, bottom);
+        let row = row.clamp(top.min(bottom), bottom);
         let n = n.min(bottom - row + 1);
         for _ in 0..n {
             self.lines.insert(row, self.blank_row());
@@ -205,7 +205,7 @@ impl Grid {
     /// pulling lines from below up; blanks fill the bottom of the region.
     pub fn delete_lines(&mut self, top: usize, bottom: usize, row: usize, n: usize) {
         let bottom = bottom.min(self.rows.saturating_sub(1));
-        let row = row.clamp(top, bottom);
+        let row = row.clamp(top.min(bottom), bottom);
         let n = n.min(bottom - row + 1);
         for _ in 0..n {
             self.lines.remove(row);
@@ -297,34 +297,36 @@ impl Grid {
                 new_rows_buf.push(Row::blank(new_cols));
                 continue;
             }
+            // Every emitted row is padded to exactly `new_cols` cells: the
+            // emulator indexes `cells[col]` for any `col < cols`.
             let mut cells: Vec<Cell> = Vec::with_capacity(new_cols);
             let mut i = 0;
             while i < line.len() {
                 let cell = &line[i];
-                let cw = cell.width.max(1) as usize;
-                if cw == 2 && cells.len() + cw > new_cols {
-                    // A wide char cannot span a column boundary: drop its
-                    // trailing half and clamp it to width 1 at the last column.
-                    let mut cc = cell.clone();
-                    cc.width = 1;
-                    cc.continued = false;
-                    cc.combining = Vec::new();
-                    cells.push(cc);
+                // The trailing half of a wide char is regenerated below
+                // alongside its leading half; copying it too would insert a
+                // spurious blank after every wide char on each reflow.
+                if cell.continued {
                     i += 1;
                     continue;
                 }
+                // A wide char can never fit a 1-column grid: clamp it to width 1.
+                let cw = if new_cols < 2 { 1 } else { cell.width.max(1) as usize };
                 if cells.len() + cw > new_cols {
-                    // Row is full and more content follows: wrap it.
+                    // Row is full (or a wide char would straddle the margin) and
+                    // more content follows: pad and wrap it.
+                    cells.resize(new_cols, Cell::default());
                     new_rows_buf.push(Row {
                         cells: std::mem::take(&mut cells),
                         wrapped: true,
                     });
                     continue;
                 }
+                let mut cc = cell.clone();
+                cc.continued = false;
+                cc.width = cw as u8;
+                cells.push(cc);
                 if cw == 2 {
-                    let mut cc = cell.clone();
-                    cc.continued = false;
-                    cells.push(cc);
                     cells.push(Cell {
                         ch: ' ',
                         width: 0,
@@ -332,15 +334,10 @@ impl Grid {
                         combining: Vec::new(),
                         attr: cell.attr,
                     });
-                    i += 1;
-                } else {
-                    let mut cc = cell.clone();
-                    cc.continued = false;
-                    cc.width = 1;
-                    cells.push(cc);
-                    i += 1;
                 }
+                i += 1;
             }
+            cells.resize(new_cols, Cell::default());
             new_rows_buf.push(Row {
                 cells,
                 wrapped: false,

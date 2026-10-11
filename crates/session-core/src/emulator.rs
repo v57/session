@@ -43,6 +43,18 @@ struct SavedState {
     scroll_bottom: usize,
 }
 
+impl SavedState {
+    /// Fit the saved cursor and scroll region inside a `rows` x `cols` screen.
+    fn clamp(&mut self, rows: usize, cols: usize) {
+        let bottom = rows - 1;
+        self.cursor.row = self.cursor.row.min(bottom);
+        self.cursor.col = self.cursor.col.min(cols - 1);
+        self.cursor.wrap_pending = false;
+        self.scroll_top = self.scroll_top.min(bottom);
+        self.scroll_bottom = self.scroll_bottom.max(self.scroll_top).min(bottom);
+    }
+}
+
 /// A vte-driven terminal emulator buffer.
 pub struct Emulator {
     primary: Grid,
@@ -110,6 +122,7 @@ impl Emulator {
             while grid.lines.len() < rows {
                 grid.lines.push(Row::blank(cols));
             }
+            grid.fit_lines();
         }
         self.scroll_top = self.scroll_top.min(bottom);
         self.scroll_bottom = self.scroll_bottom.max(self.scroll_top).min(bottom);
@@ -117,6 +130,11 @@ impl Emulator {
         cursor.row = cursor.row.min(bottom);
         cursor.col = cursor.col.min(cols - 1);
         cursor.wrap_pending = false;
+        // Saved states (DECSC / CSI s, and the primary state parked at smcup)
+        // are restored verbatim later, so they must fit the new size too.
+        for saved in [&mut self.saved, &mut self.saved_primary].into_iter().flatten() {
+            saved.clamp(rows, cols);
+        }
     }
 
     /// Full terminal reset (ESC c / RIS).
@@ -223,6 +241,7 @@ impl Emulator {
     /// and zero-width combining marks.
     fn write_char(&mut self, c: char) {
         let cols = self.cols;
+        let rows = self.rows;
         let wrap_enabled = self.wrap_enabled;
         let bottom = self.scroll_bottom;
         let top = self.scroll_top;
@@ -238,13 +257,18 @@ impl Emulator {
             grid.lines[cursor.row].wrapped = true;
             if cursor.row == bottom {
                 grid.scroll_up(top, bottom);
-            } else {
+            } else if cursor.row + 1 < rows {
+                // Below the scroll region on the last line: stay put.
                 cursor.row += 1;
             }
             cursor.col = 0;
         }
 
-        let w = char_width(c);
+        // A wide char can never fit a 1-column screen: treat it as narrow.
+        let w = match char_width(c) {
+            2 if cols < 2 => 1,
+            w => w,
+        };
         if w == 0 {
             // Zero-width (combining): attach to the previously written cell.
             if cursor.col > 0 {
@@ -259,13 +283,22 @@ impl Emulator {
 
         // Make room for a wide character (2 cells).
         if w == 2 && cursor.col + 2 > cols {
-            grid.lines[cursor.row].wrapped = true;
-            if cursor.row == bottom {
-                grid.scroll_up(top, bottom);
+            if wrap_enabled {
+                grid.lines[cursor.row].wrapped = true;
+                if cursor.row == bottom {
+                    grid.scroll_up(top, bottom);
+                } else if cursor.row + 1 < rows {
+                    cursor.row += 1;
+                }
+                cursor.col = 0;
             } else {
-                cursor.row += 1;
+                cursor.col = cols - 2;
             }
-            cursor.col = 0;
+        }
+        // With autowrap off (DECAWM reset) the cursor sticks at the right
+        // margin and each further char overwrites the last column.
+        if cursor.col + w as usize > cols {
+            cursor.col = cols - w as usize;
         }
 
         let row = cursor.row;
@@ -1016,6 +1049,147 @@ mod tests {
             .map(|c| c.attr.fg)
             .collect();
         assert!(colors.contains(&Color::Rgb(1, 2, 3)));
+    }
+
+    /// The structural invariants every grid operation relies on for indexing.
+    fn assert_invariants(e: &Emulator, ctx: &str) {
+        for (name, grid) in [("primary", &e.primary), ("alt", &e.alt)] {
+            assert_eq!(grid.lines.len(), e.rows, "{ctx}: {name} row count");
+            for (i, row) in grid.lines.iter().enumerate() {
+                assert_eq!(row.cells.len(), e.cols, "{ctx}: {name} row {i} width");
+            }
+        }
+        assert!(e.cursor.row < e.rows, "{ctx}: cursor row {}", e.cursor.row);
+        assert!(e.cursor.col <= e.cols, "{ctx}: cursor col {}", e.cursor.col);
+        assert!(e.scroll_top <= e.scroll_bottom, "{ctx}: scroll region inverted");
+        assert!(e.scroll_bottom < e.rows, "{ctx}: scroll bottom {}", e.scroll_bottom);
+    }
+
+    // Regression: reflow used to leave rows shorter than the width, so the next
+    // printed char after any resize indexed past the end of its row.
+    #[test]
+    fn print_after_resize_does_not_panic() {
+        let mut e = Emulator::new(24, 80, 100);
+        e.ingest(b"sh-3.2$ ");
+        e.resize(24, 100);
+        e.ingest(b"echo hi\x1b[1;10H\x1b[5P\x1b[3@");
+        assert_invariants(&e, "after resize");
+        assert_eq!(row_text(&e.viewport()[0]), "sh-3.2$ e   i");
+    }
+
+    // Regression: with autowrap off the cursor sticks at the right margin and
+    // overwrites the last column instead of writing past the row.
+    #[test]
+    fn autowrap_off_overwrites_last_column() {
+        let mut e = Emulator::new(2, 5, 100);
+        e.ingest(b"\x1b[?7labcdefg");
+        assert_eq!(row_text(&e.viewport()[0]), "abcdg");
+        assert_eq!(row_text(&e.viewport()[1]), "");
+        e.ingest("\u{6f22}".as_bytes()); // a wide char lands in the last two columns
+        assert_eq!(row_text(&e.viewport()[0]), "abc\u{6f22}");
+        assert_invariants(&e, "autowrap off");
+    }
+
+    // Regression: saved cursors (smcup's parked primary state, DECSC, CSI s)
+    // used to be restored at their pre-resize position, past the new bottom.
+    #[test]
+    fn saved_state_is_clamped_on_shrink() {
+        let mut e = Emulator::new(50, 80, 100);
+        e.ingest(b"\x1b[50;1H$ \x1b[?1049h");
+        e.resize(24, 80);
+        e.ingest(b"\x1b[?1049lx");
+        assert_invariants(&e, "rmcup after shrink");
+
+        let mut e = Emulator::new(50, 80, 100);
+        e.ingest(b"\x1b[45;70H\x1b7\x1b[s");
+        e.resize(24, 40);
+        e.ingest(b"\x1b8x\x1b[ux\x1b[L\x1b[M");
+        assert_invariants(&e, "DECRC after shrink");
+    }
+
+    // Reflow must not grow a wide char's trailing half into an extra blank.
+    #[test]
+    fn reflow_keeps_wide_chars_two_cells() {
+        let mut e = Emulator::new(2, 10, 100);
+        e.ingest("\u{6f22}\u{5b57}x".as_bytes());
+        e.resize(2, 12);
+        e.resize(2, 10);
+        assert_eq!(row_text(&e.viewport()[0]), "\u{6f22}\u{5b57}x");
+    }
+
+    // Deterministic stress: random printable text, controls, wide/combining
+    // chars, CSI/ESC sequences, and resizes (down to 1x1) must never panic or
+    // break the grid invariants, and a snapshot must always replay cleanly.
+    #[test]
+    fn random_input_and_resizes_never_panic() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        const FINALS: &[u8] = b"ABCDEFGHJKLMPSTX@dfrsumhl`";
+        const PRIVATE_MODES: &[u64] = &[7, 25, 47, 1047, 1049];
+
+        for seed in 1..=150u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut e = Emulator::new(24, 80, 50);
+            for step in 0..300 {
+                let mut bytes: Vec<u8> = Vec::new();
+                match rng.below(10) {
+                    0 => {
+                        let rows = 1 + rng.below(60) as usize;
+                        let cols = 1 + rng.below(160) as usize;
+                        e.resize(rows, cols);
+                    }
+                    1 => {
+                        let mode = PRIVATE_MODES[rng.below(PRIVATE_MODES.len() as u64) as usize];
+                        let set = if rng.below(2) == 0 { 'h' } else { 'l' };
+                        bytes.extend_from_slice(format!("\x1b[?{mode}{set}").as_bytes());
+                    }
+                    2 | 3 => {
+                        bytes.extend_from_slice(b"\x1b[");
+                        if rng.below(4) == 0 {
+                            bytes.push(b"?><"[rng.below(3) as usize]);
+                        }
+                        for i in 0..rng.below(3) {
+                            if i > 0 {
+                                bytes.push(b';');
+                            }
+                            if rng.below(4) > 0 {
+                                bytes.extend_from_slice(rng.below(90).to_string().as_bytes());
+                            }
+                        }
+                        bytes.push(FINALS[rng.below(FINALS.len() as u64) as usize]);
+                    }
+                    4 => {
+                        bytes.push(0x1b);
+                        bytes.push(b"78MDEc"[rng.below(6) as usize]);
+                    }
+                    5 => bytes.push(b"\r\n\x08\t\x0b"[rng.below(5) as usize]),
+                    6 => bytes.extend_from_slice(
+                        ["\u{6f22}", "\u{1f600}", "e\u{301}", "\u{ff21}"][rng.below(4) as usize]
+                            .as_bytes(),
+                    ),
+                    _ => {
+                        for _ in 0..1 + rng.below(120) {
+                            bytes.push(b' ' + rng.below(95) as u8);
+                        }
+                    }
+                }
+                e.ingest(&bytes);
+                assert_invariants(&e, &format!("seed {seed} step {step} after {bytes:?}"));
+            }
+            let mut replay = Emulator::new(e.rows, e.cols, 50);
+            replay.ingest(&e.render_snapshot());
+            assert_invariants(&replay, &format!("seed {seed} replay"));
+        }
     }
 
     #[test]
