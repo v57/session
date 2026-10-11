@@ -341,10 +341,10 @@ fn make_title(argv: Option<Vec<OsString>>) -> String {
             let parts: Vec<String> = a.iter().map(|s| s.to_string_lossy().into_owned()).collect();
             parts.join(" ")
         }
-        _ => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "shell".to_string());
-            shell
-        }
+        // What portable-pty runs by default: `$SHELL` (else the password
+        // database) on Unix, `%ComSpec%` on Windows.
+        _ if cfg!(windows) => std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+        _ => std::env::var("SHELL").unwrap_or_else(|_| "shell".to_string()),
     }
 }
 
