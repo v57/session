@@ -161,7 +161,15 @@ impl Conn {
 /// size probe. Returns an error when stdout is not a TTY.
 pub fn terminal_size() -> std::io::Result<Size> {
     let (cols, rows) = crossterm::terminal::size()?;
-    Ok((rows.max(1), cols.max(1)))
+    usable_size(cols, rows).ok_or_else(|| std::io::Error::other("the terminal reports no size"))
+}
+
+/// `(rows, cols)` from a reported `cols` x `rows`, or `None` when either is 0:
+/// a pty nobody sized (some CI runners, `script`, ssh without a size) reports
+/// 0x0, and passing that on would give the session a 1-column screen. The
+/// caller falls back to [`ProxyOptions::fallback_size`] instead.
+fn usable_size(cols: u16, rows: u16) -> Option<Size> {
+    (cols > 0 && rows > 0).then_some((rows, cols))
 }
 
 /// A default TERM value for the session child: an existing rich TERM is kept,
@@ -1009,6 +1017,13 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unsized_terminal_falls_back() {
+        assert_eq!(usable_size(80, 24), Some((24, 80)));
+        assert_eq!(usable_size(0, 0), None);
+        assert_eq!(usable_size(80, 0), None);
     }
 
     #[test]
