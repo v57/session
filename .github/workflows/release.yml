@@ -1,0 +1,91 @@
+# Builds `session` for every platform when a version tag (v0.1.0, ...) is
+# pushed and attaches the archives and SHA256SUMS to that tag's GitHub Release.
+# Asset names carry no version, so the install scripts can always fetch
+# https://github.com/v57/session/releases/latest/download/<asset>.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and (re)upload
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          # musl: one static binary that runs on any distro.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          name=session-${{ matrix.target }}
+          bin=target/${{ matrix.target }}/release
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "$bin/session.exe" LICENSE dist/
+            (cd dist && 7z a -tzip "$name.zip" session.exe LICENSE >/dev/null && rm session.exe LICENSE)
+          else
+            cp "$bin/session" LICENSE dist/
+            (cd dist && tar -czf "$name.tar.gz" session LICENSE && rm session LICENSE)
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: session-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum session-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
