@@ -33,6 +33,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc;
 
+/// After the child exits, how long [`Pty::read`] waits for more of its output
+/// before reporting the end.
+const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// A single PTY-backed child process and the master side that drives it.
 pub struct Pty {
     /// Master end, retained (and usable via `&self`) for resize/winsize control
@@ -44,6 +48,8 @@ pub struct Pty {
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Asynchronous child-exit notification (wait thread → caller).
     exit_rx: mpsc::UnboundedReceiver<PtyExitStatus>,
+    /// Set once [`read`](Pty::read) has seen the child exit.
+    exit_seen: bool,
     /// Idempotent sync copy of the exit status, set once by the wait thread.
     exit_status: Arc<Mutex<Option<PtyExitStatus>>>,
     /// Cheap "is the child gone?" flag, set once by the wait thread.
@@ -115,6 +121,7 @@ impl Pty {
             rx,
             writer_tx,
             exit_rx,
+            exit_seen: false,
             exit_status,
             exited,
             process_id,
@@ -123,10 +130,26 @@ impl Pty {
         })
     }
 
-    /// Await the next chunk of child output. `None` means the child closed its
-    /// output side (typically it exited).
+    /// Await the next chunk of child output. `None` means the child is done:
+    /// it closed its output side, or it exited and its last output has arrived.
+    ///
+    /// Exit has to be watched as well as EOF: on Windows the output pipe stays
+    /// open after the child exits (ConPTY closes it only with the
+    /// pseudoconsole), so EOF alone would leave a finished session running.
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+        if !self.exit_seen {
+            tokio::select! {
+                biased;
+                chunk = self.rx.recv() => return chunk,
+                _ = self.exit_rx.recv() => self.exit_seen = true,
+            }
+        }
+        // The child is gone; take what it wrote before exiting until the
+        // output ends or goes quiet.
+        tokio::time::timeout(EXIT_DRAIN, self.rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Non-blocking read of any immediately-available output chunk.
@@ -204,24 +227,21 @@ impl Pty {
 
     /// Await the child's exit status.
     pub async fn wait(&mut self) -> PtyExitStatus {
-        match self.exit_rx.recv().await {
-            Some(st) => st,
-            None => PtyExitStatus::with_exit_code(1),
-        }
+        // `None` once `read` has taken the notification; the status is stored.
+        let status = self.exit_rx.recv().await;
+        status.or_else(|| self.exit_status()).unwrap_or_else(|| PtyExitStatus::with_exit_code(1))
     }
 
     /// Non-blocking: return the exit status if the child has already exited.
     pub fn try_wait(&mut self) -> Option<PtyExitStatus> {
-        self.exit_rx.try_recv().ok()
+        self.exit_rx.try_recv().ok().or_else(|| self.exit_status())
     }
 
     /// Blocking wait for the child's exit status (for sync callers and tests;
     /// must NOT be called from within an async runtime).
     pub fn wait_blocking(&mut self) -> PtyExitStatus {
-        match self.exit_rx.blocking_recv() {
-            Some(st) => st,
-            None => PtyExitStatus::with_exit_code(1),
-        }
+        let status = self.exit_rx.blocking_recv();
+        status.or_else(|| self.exit_status()).unwrap_or_else(|| PtyExitStatus::with_exit_code(1))
     }
 
     /// Terminate the child (portable-pty sends `SIGHUP` to the process group).
