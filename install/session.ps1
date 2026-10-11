@@ -21,13 +21,13 @@
 
     $arch = $env:PROCESSOR_ARCHITECTURE
     if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }  # 32-bit PowerShell on 64-bit Windows
-    switch ($arch) {
-        'AMD64' { }
-        'ARM64' { Write-Host 'No ARM64 build yet: installing the x86_64 build, which Windows on ARM runs under emulation.' }
+    $target = switch ($arch) {
+        'AMD64' { 'x86_64-pc-windows-msvc' }
+        'ARM64' { 'aarch64-pc-windows-msvc' }
         default { throw "session install: unsupported CPU: $arch" }
     }
 
-    $asset = 'session-x86_64-pc-windows-msvc.zip'
+    $asset = "session-$target.zip"
     $base = if ($env:SESSION_DOWNLOAD_URL) {
         $env:SESSION_DOWNLOAD_URL
     } elseif ($version -eq 'latest') {
