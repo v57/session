@@ -122,6 +122,11 @@ impl Client {
                 check_version(daemon_version).map_err(|e| ConnectError::Version(e.to_string()))?;
                 Ok(Self { reader, writer })
             }
+            // The daemon checks our version first and refuses a mismatch with
+            // an Error ("protocol version mismatch: daemon speaks v2, ...").
+            Ok(DaemonToClient::Error { message }) if message.contains("version mismatch") => {
+                Err(ConnectError::Version(message))
+            }
             Ok(other) => Err(ConnectError::Handshake(format!(
                 "expected Hello, received {other:?}"
             ))),

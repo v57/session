@@ -2,9 +2,10 @@
 //!
 //! This is the transport the Shell app (and any terminal) uses when it attaches
 //! to a [`session_core`] daemon session. It is deliberately *transparent*: it
-//! does **not** parse or render anything. It puts the surrounding terminal into
-//! raw mode (crossterm, on Unix and Windows), sends the attach/create frame, and
-//! then:
+//! does **not** parse or render anything. It sends the attach/create frame,
+//! waits for the daemon's `Attached` (asking for the session's password first
+//! if the daemon wants one, see [`open_session`]), puts the surrounding
+//! terminal into raw mode (crossterm, on Unix and Windows), and then:
 //!
 //! * daemon `Output` / `redraw_bytes` frames  ->  written straight to `stdout`
 //!   (the surrounding terminal renders them);
@@ -78,6 +79,8 @@ pub struct ProxyOptions {
     pub term: Option<String>,
     /// Size used when the real terminal size cannot be read (e.g. not a TTY).
     pub fallback_size: Size,
+    /// Give a newly created session a password (`session -p`).
+    pub protect: bool,
 }
 
 impl Default for ProxyOptions {
@@ -86,6 +89,7 @@ impl Default for ProxyOptions {
             raw_mode: true,
             term: Some(default_term()),
             fallback_size: (24, 80),
+            protect: false,
         }
     }
 }
@@ -193,10 +197,68 @@ fn attach_frame(session: &str, cmd: Option<&str>, term: Option<&str>, create: bo
         ClientToDaemon::AttachCreate {
             session_id: session.to_string(),
             cmd: cmd.map(|c| with_term_prefix(c, term)),
+            password: None,
+            protect: false,
         }
     } else {
         ClientToDaemon::Attach {
             session_id: session.to_string(),
+            password: None,
+        }
+    }
+}
+
+/// `frame` carrying `password`, and asking for a protected session when
+/// `protect` (create only).
+fn with_password(frame: &ClientToDaemon, password: Option<String>, protect: bool) -> ClientToDaemon {
+    match frame.clone() {
+        ClientToDaemon::AttachCreate { session_id, cmd, .. } => ClientToDaemon::AttachCreate {
+            session_id,
+            cmd,
+            password,
+            protect,
+        },
+        ClientToDaemon::Attach { session_id, .. } => ClientToDaemon::Attach {
+            session_id,
+            password,
+        },
+        other => other,
+    }
+}
+
+/// Send the attach/create `frame` and wait for the daemon's `Attached`,
+/// returning its redraw bytes. A `PasswordRequired` answer is met by asking
+/// `asker` and sending the frame again; with `protect` the new session's
+/// password is asked for up front. Runs before raw mode, so a prompt reads
+/// like any other terminal prompt.
+async fn open_session(
+    conn: &mut Conn,
+    session: &str,
+    frame: &ClientToDaemon,
+    protect: bool,
+    asker: &mut crate::password::Asker,
+) -> anyhow::Result<Vec<u8>> {
+    let mut password = if protect {
+        Some(asker.new_password(session)?)
+    } else {
+        None
+    };
+    loop {
+        conn.send(with_password(frame, password.take(), protect)).await?;
+        loop {
+            let mut line = String::new();
+            if conn.reader.read_line(&mut line).await? == 0 {
+                return Err(anyhow!("daemon closed the connection"));
+            }
+            match DaemonToClient::from_frame(line.as_bytes())? {
+                DaemonToClient::Attached { redraw_bytes, .. } => return Ok(redraw_bytes),
+                DaemonToClient::PasswordRequired { wrong, .. } => {
+                    password = Some(asker.existing(session, wrong)?);
+                    break;
+                }
+                DaemonToClient::Error { message } => return Err(anyhow!(message)),
+                _ => {} // strays before the attach answer are ignored
+            }
         }
     }
 }
@@ -245,7 +307,14 @@ pub fn attach(
         .enable_all()
         .build()?;
     let outcome = rt.block_on(async move {
-        let conn = Conn::connect(config).await?;
+        let mut conn = Conn::connect(config).await?;
+
+        // The attach (or create-attach) frame; a custom command may carry the
+        // TERM prefix so the daemon-spawned child sees a truecolor terminal.
+        let frame = attach_frame(session, cmd, opts.term.as_deref(), create);
+        let mut asker = crate::password::Asker::from_env();
+        let protect = opts.protect && create;
+        let redraw = open_session(&mut conn, session, &frame, protect, &mut asker).await?;
 
         // Report the real terminal size immediately (spec: "send Resize
         // immediately"). Fall back to a sane default for non-TTY stdout.
@@ -257,10 +326,6 @@ pub fn attach(
         let resize_task = spawn_resize_watcher(resize_tx);
         let term_task = spawn_terminate_watcher(term_tx);
 
-        // The attach (or create-attach) frame; a custom command may carry the
-        // TERM prefix so the daemon-spawned child sees a truecolor terminal.
-        let frame = attach_frame(session, cmd, opts.term.as_deref(), create);
-
         if opts.raw_mode {
             if let Err(e) = crossterm::terminal::enable_raw_mode() {
                 return Err(anyhow!("cannot enter raw mode (is stdout a terminal?): {e}"));
@@ -271,7 +336,7 @@ pub fn attach(
             conn,
             tokio::io::stdin(),
             tokio::io::stdout(),
-            frame,
+            redraw,
             initial_size,
             resize_rx,
             term_rx,
@@ -307,10 +372,10 @@ pub fn attach(
     }
 }
 
-/// The testable core of the proxy.
+/// The testable core of the proxy, run once [`open_session`] attached.
 ///
-/// Sends the attach/create frame and an initial `Resize` over `conn`'s writer,
-/// spawns the daemon→`stdout` task, then drives the stdin→`Input` / resize /
+/// Writes the attach `redraw` to `stdout`, sends an initial `Resize` over
+/// `conn`'s writer, spawns the daemon→`stdout` task, then drives the stdin→`Input` / resize /
 /// terminate loop. Returns once the client detaches or the daemon closes. This
 /// is generic over the byte endpoints so a pipe harness can substitute in-memory
 /// streams and never needs a real TTY or raw mode.
@@ -318,7 +383,7 @@ async fn proxy_loop<S, W>(
     conn: Conn,
     mut stdin: S,
     stdout: W,
-    attach: ClientToDaemon,
+    redraw: Vec<u8>,
     initial_size: Size,
     mut resize_rx: mpsc::UnboundedReceiver<Size>,
     mut term_rx: mpsc::UnboundedReceiver<()>,
@@ -329,8 +394,7 @@ where
 {
     let Conn { mut writer, reader } = conn;
 
-    // Attach (or create-attach), then report the terminal size immediately.
-    writer.write_all(&attach.to_frame()?).await?;
+    // Attached already: report the terminal size immediately.
     writer
         .write_all(
             &ClientToDaemon::Resize {
@@ -348,7 +412,12 @@ where
     let reader_task = tokio::spawn(async move {
         let mut reader = reader;
         let mut stdout = stdout;
-        let result = forward_daemon_to_stdout(&mut reader, &mut stdout).await;
+        let result = async {
+            stdout.write_all(&redraw).await?;
+            stdout.flush().await?;
+            forward_daemon_to_stdout(&mut reader, &mut stdout).await
+        }
+        .await;
         let _ = done_tx.send(result);
     });
 
@@ -517,6 +586,7 @@ fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::password::Asker;
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
     use session_core::config::Config;
     use std::path::Path;
@@ -605,7 +675,12 @@ mod tests {
         let (in_r, mut in_w) = tokio::io::duplex(1024); // proxy stdin <- test writes
         let (mut out_r, out_w) = tokio::io::duplex(1024); // proxy stdout -> test reads
 
-        let conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let mut conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let frame = attach_frame("s1", None, None, true);
+        let redraw = open_session(&mut conn, "s1", &frame, false, &mut Asker::new(None))
+            .await
+            .expect("attach");
+        assert_eq!(redraw, b"\x1b[2J");
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
         let (_term_tx, term_rx) = mpsc::unbounded_channel();
 
@@ -614,10 +689,7 @@ mod tests {
                 conn,
                 in_r,
                 out_w,
-                ClientToDaemon::AttachCreate {
-                    session_id: "s1".to_string(),
-                    cmd: None,
-                },
+                redraw,
                 (24, 80),
                 resize_rx,
                 term_rx,
@@ -720,6 +792,8 @@ mod tests {
             ClientToDaemon::AttachCreate {
                 session_id: "s1".to_string(),
                 cmd: Some("env TERM=xterm-256color vim".to_string()),
+                password: None,
+                protect: false,
             }
         );
     }
@@ -732,12 +806,17 @@ mod tests {
             ClientToDaemon::AttachCreate {
                 session_id: "s1".to_string(),
                 cmd: Some("vim".to_string()),
+                password: None,
+                protect: false,
             }
         );
         // create=false (explicit `session attach`) is unaffected by TERM.
         assert_eq!(
             attach_frame("s1", None, Some("xterm-256color"), false),
-            ClientToDaemon::Attach { session_id: "s1".to_string() }
+            ClientToDaemon::Attach {
+                session_id: "s1".to_string(),
+                password: None
+            }
         );
         // create=true with a bare name sends AttachCreate{None}, so `session
         // <name>` creates a default-shell session when the name is new.
@@ -745,7 +824,9 @@ mod tests {
             attach_frame("s1", None, Some("xterm-256color"), true),
             ClientToDaemon::AttachCreate {
                 session_id: "s1".to_string(),
-                cmd: None
+                cmd: None,
+                password: None,
+                protect: false,
             }
         );
     }
@@ -841,7 +922,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
-        let conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let mut conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let frame = attach_frame("s1", None, None, true);
+        let redraw = open_session(&mut conn, "s1", &frame, false, &mut Asker::new(None))
+            .await
+            .expect("attach");
         let (in_r, _in_w) = tokio::io::duplex(64); // stdin stays open, no input
         let (_out_r, out_w) = tokio::io::duplex(64);
         let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
@@ -850,10 +935,7 @@ mod tests {
             conn,
             in_r,
             out_w,
-            ClientToDaemon::AttachCreate {
-                session_id: "s1".into(),
-                cmd: None,
-            },
+            redraw,
             (24, 80),
             resize_rx,
             term_rx,
@@ -864,6 +946,68 @@ mod tests {
             exit,
             ProxyExit::Closed,
             "proxy must close (not hang) when the session's child exits"
+        );
+    }
+
+    // A protected session: the daemon answers the bare attach with
+    // PasswordRequired, and `open_session` sends the frame again with the
+    // asker's password before the proxy starts.
+    #[tokio::test]
+    async fn open_session_answers_a_password_challenge() {
+        let dir = tempdir().unwrap();
+        let cfg = temp_config(&dir);
+        let name = cfg.socket_path.clone().to_fs_name::<GenericFilePath>().unwrap();
+        let listener = ListenerOptions::new()
+            .name(name)
+            .try_overwrite(true)
+            .create_tokio()
+            .unwrap();
+        let daemon = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let (mut read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(&mut read_half);
+            let mut frames = Vec::new();
+            for reply in [
+                DaemonToClient::Hello {
+                    daemon_version: PROTOCOL_VERSION,
+                },
+                DaemonToClient::PasswordRequired {
+                    session_id: "s1".into(),
+                    wrong: false,
+                },
+                DaemonToClient::Attached {
+                    session_id: "s1".into(),
+                    redraw_bytes: b"screen".to_vec(),
+                },
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                frames.push(ClientToDaemon::from_frame(line.as_bytes()).unwrap());
+                write_half.write_all(&reply.to_frame().unwrap()).await.unwrap();
+            }
+            frames
+        });
+
+        let mut conn = Conn::connect(&cfg).await.expect("connect to fake daemon");
+        let frame = attach_frame("s1", None, None, false);
+        let mut asker = Asker::new(Some("pw".into()));
+        let redraw = open_session(&mut conn, "s1", &frame, false, &mut asker)
+            .await
+            .expect("attach with the password");
+        assert_eq!(redraw, b"screen");
+        let frames = daemon.await.unwrap();
+        assert_eq!(
+            frames[1..],
+            [
+                ClientToDaemon::Attach {
+                    session_id: "s1".into(),
+                    password: None
+                },
+                ClientToDaemon::Attach {
+                    session_id: "s1".into(),
+                    password: Some("pw".into())
+                },
+            ]
         );
     }
 

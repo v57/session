@@ -58,8 +58,17 @@
 //! in, the daemon guarantees a usable working directory at startup (falling back
 //! to the user's home directory if the inherited one is not usable), so session
 //! children always have somewhere sane to start.
+//!
+//! # Passwords
+//!
+//! A session created with `protect` (see [`crate::password`]) refuses
+//! `Attach`, resume via `AttachCreate`, `Kill`, `Rename` and `Cwd` unless the
+//! frame carries its password, answering `PasswordRequired` instead; the client
+//! asks the user and repeats the request. The check and the operation run under
+//! the same registry lock. `KillAll` leaves protected sessions running.
 
 use crate::config::Config;
+use crate::password::{Denied, WRONG_PASSWORD_DELAY};
 use crate::protocol::{
     check_version, ClientToDaemon, DaemonToClient, SessionInfo as WireSessionInfo, PROTOCOL_VERSION,
 };
@@ -341,19 +350,24 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 send_frame(&writer_tx, DaemonToClient::Listing { sessions }).await?;
             }
 
-            ClientToDaemon::Cwd { session_id } => {
-                // Only the pid lookup holds the registry lock. The cwd query
-                // itself can shell out (`lsof` on macOS), so it runs on the
-                // blocking pool instead of stalling every other connection.
-                let pid = registry
-                    .lock()
-                    .unwrap()
-                    .find(&session_id)
-                    .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))
-                    .and_then(|s| {
-                        s.process_id()
+            ClientToDaemon::Cwd {
+                session_id,
+                password,
+            } => {
+                let _turn = password_turn(&registry, &session_id, password.as_deref()).await;
+                // Only the password check and pid lookup hold the registry
+                // lock. The cwd query itself can shell out (`lsof` on macOS),
+                // so it runs on the blocking pool instead of stalling every
+                // other connection.
+                let pid = {
+                    let reg = registry.lock().unwrap();
+                    reg.authorize(&session_id, password.as_deref()).and_then(|()| {
+                        reg.find(&session_id)
+                            .ok_or_else(|| anyhow::anyhow!("no such session: {session_id}"))?
+                            .process_id()
                             .ok_or_else(|| anyhow::anyhow!("session has no process id"))
-                    });
+                    })
+                };
                 let result = match pid {
                     Ok(pid) => tokio::task::spawn_blocking(move || crate::cwd::process_cwd(pid))
                         .await?
@@ -365,23 +379,22 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                     Ok(cwd) => {
                         send_frame(&writer_tx, DaemonToClient::Cwd { session_id, cwd }).await?
                     }
-                    Err(e) => {
-                        let _ = send_frame(
-                            &writer_tx,
-                            DaemonToClient::Error { message: e.to_string() },
-                        )
-                        .await;
-                    }
+                    Err(e) => send_failure(&writer_tx, &session_id, e).await,
                 }
             }
 
-            ClientToDaemon::Rename { from, to } => {
+            ClientToDaemon::Rename { from, to, password } => {
                 // Rename refuses attached sessions and taken names; the
                 // registry moves the key AND the session's stored id. Only a
                 // headless client issues rename (attach proxies never do), but
                 // keep this connection's own binding honest in case it ever
                 // renames the session it is attached to (daemon-side no-op).
-                let rename_result = registry.lock().unwrap().rename(&from, &to);
+                let _turn = password_turn(&registry, &from, password.as_deref()).await;
+                let rename_result = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.authorize(&from, password.as_deref())
+                        .and_then(|()| reg.rename(&from, &to))
+                };
                 match rename_result {
                     Ok(()) => {
                         if attached.as_deref() == Some(from.as_str()) {
@@ -390,22 +403,22 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         send_frame(&writer_tx, DaemonToClient::Renamed { session_id: to })
                             .await?;
                     }
-                    Err(e) => {
-                        let _ = send_frame(
-                            &writer_tx,
-                            DaemonToClient::Error { message: e.to_string() },
-                        )
-                        .await;
-                    }
+                    Err(e) => send_failure(&writer_tx, &from, e).await,
                 }
             }
 
-            ClientToDaemon::Attach { session_id } => {
-                // Reap finished sessions, then attach to the live one.
+            ClientToDaemon::Attach {
+                session_id,
+                password,
+            } => {
+                let _turn = password_turn(&registry, &session_id, password.as_deref()).await;
+                // Reap finished sessions, then check the password and attach
+                // under the same lock, so the session can't change in between.
                 let attach_result = {
                     let mut reg = registry.lock().unwrap();
                     reg.reap_exited();
-                    reg.attach(&session_id, client_id.clone())
+                    reg.authorize(&session_id, password.as_deref())
+                        .and_then(|()| reg.attach(&session_id, client_id.clone()))
                 };
                 match attach_result {
                     Ok(handle) => {
@@ -430,49 +443,52 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                             handle.receiver,
                         ));
                     }
-                    Err(e) => {
-                        let _ = send_frame(
-                            &writer_tx,
-                            DaemonToClient::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
+                    Err(e) => send_failure(&writer_tx, &session_id, e).await,
                 }
             }
 
-            ClientToDaemon::AttachCreate { session_id, cmd } => {
+            ClientToDaemon::AttachCreate {
+                session_id,
+                cmd,
+                password,
+                protect,
+            } => {
                 // Create-or-attach: if a session with this name is already live,
                 // attach to it and IGNORE the command (resume). Otherwise create
                 // a new session under that name running `cmd` (or the default
                 // shell), then attach. The requested name IS the session id.
+                //
+                // Everything happens under one registry lock: a protected
+                // session gets its password before anyone else can attach, and
+                // an existing one is checked and attached with no gap between.
                 let argv = cmd.as_deref().map(split_command);
-                let created = {
+                let _turn = password_turn(&registry, &session_id, password.as_deref()).await;
+                let attach_result = {
                     let mut reg = registry.lock().unwrap();
                     // A finished session is gone: drop it so set_name re-creates
                     // fresh rather than resurrecting a zombie.
                     reg.reap_exited();
                     if reg.contains(&session_id) {
-                        Ok(())
+                        reg.authorize(&session_id, password.as_deref()).and_then(|()| {
+                            if protect && !reg.is_protected(&session_id) {
+                                Err(anyhow::anyhow!(
+                                    "session '{session_id}' already exists without a password"
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    } else if protect && password.as_deref().is_none_or(str::is_empty) {
+                        Err(anyhow::anyhow!("a protected session needs a non-empty password"))
                     } else {
                         reg.create_session(&session_id, argv)
+                            .map_err(|e| anyhow::anyhow!("failed to create session {session_id}: {e}"))
+                            .and_then(|()| match password.as_deref().filter(|_| protect) {
+                                Some(password) => reg.protect(&session_id, password),
+                                None => Ok(()),
+                            })
                     }
-                };
-                if let Err(e) = created {
-                    let _ = send_frame(
-                        &writer_tx,
-                        DaemonToClient::Error {
-                            message: format!("failed to create session {session_id}: {e}"),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-                let attach_result = {
-                    let mut reg = registry.lock().unwrap();
-                    reg.reap_exited();
-                    reg.attach(&session_id, client_id.clone())
+                    .and_then(|()| reg.attach(&session_id, client_id.clone()))
                 };
                 match attach_result {
                     Ok(handle) => {
@@ -495,15 +511,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                             handle.receiver,
                         ));
                     }
-                    Err(e) => {
-                        let _ = send_frame(
-                            &writer_tx,
-                            DaemonToClient::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
+                    Err(e) => send_failure(&writer_tx, &session_id, e).await,
                 }
             }
 
@@ -560,9 +568,17 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 }
             }
 
-            ClientToDaemon::Kill { session_id } => {
+            ClientToDaemon::Kill {
+                session_id,
+                password,
+            } => {
+                let _turn = password_turn(&registry, &session_id, password.as_deref()).await;
                 // Bind to a `let` so the lock guard is dropped before the awaits.
-                let kill_result = registry.lock().unwrap().kill(&session_id);
+                let kill_result = {
+                    let mut reg = registry.lock().unwrap();
+                    reg.authorize(&session_id, password.as_deref())
+                        .and_then(|()| reg.kill(&session_id))
+                };
                 match kill_result {
                     Ok(()) => {
                         if attached.as_deref() == Some(session_id.as_str()) {
@@ -574,31 +590,30 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         send_frame(&writer_tx, DaemonToClient::Killed { session_id })
                             .await?;
                     }
-                    Err(e) => {
-                        let _ = send_frame(
-                            &writer_tx,
-                            DaemonToClient::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
+                    Err(e) => send_failure(&writer_tx, &session_id, e).await,
                 }
             }
 
             ClientToDaemon::KillAll => {
-                registry.lock().unwrap().kill_all();
-                attached = None;
-                if let Some(h) = forwarder.take() {
-                    h.abort();
-                }
-                let _ = send_frame(
-                    &writer_tx,
-                    DaemonToClient::Error {
-                        message: "killed all sessions".into(),
-                    },
-                )
-                .await;
+                // Password-protected sessions are left running.
+                let kept = {
+                    let mut reg = registry.lock().unwrap();
+                    let kept = reg.kill_all();
+                    if attached.as_deref().is_some_and(|sid| !reg.contains(sid)) {
+                        attached = None;
+                        if let Some(h) = forwarder.take() {
+                            h.abort();
+                        }
+                    }
+                    kept
+                };
+                let message = match kept {
+                    0 => "killed all sessions".to_string(),
+                    n => format!(
+                        "killed all sessions except {n} password-protected (kill those by name)"
+                    ),
+                };
+                let _ = send_frame(&writer_tx, DaemonToClient::Error { message }).await;
             }
         }
     }
@@ -655,6 +670,41 @@ fn spawn_output_forwarder(
     })
 }
 
+/// Wait for this request's turn at `session_id`'s password, when the session is
+/// protected and a password was sent. The turn is held through the check and,
+/// after a wrong password, through [`WRONG_PASSWORD_DELAY`] (see
+/// [`send_failure`]), so guesses at one session are answered one at a time no
+/// matter how many connections send them.
+async fn password_turn(
+    registry: &Mutex<Registry>,
+    session_id: &str,
+    password: Option<&str>,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    password?;
+    let turn = registry.lock().unwrap().password_turn(session_id)?;
+    Some(turn.lock_owned().await)
+}
+
+/// Report a failed request on `session_id`: a password refusal ([`Denied`])
+/// becomes `PasswordRequired`, after the wrong-password delay; anything else an
+/// `Error`.
+async fn send_failure(tx: &mpsc::UnboundedSender<Vec<u8>>, session_id: &str, e: anyhow::Error) {
+    let frame = match e.downcast_ref::<Denied>() {
+        Some(&denied) => {
+            let wrong = denied == Denied::Wrong;
+            if wrong {
+                tokio::time::sleep(WRONG_PASSWORD_DELAY).await;
+            }
+            DaemonToClient::PasswordRequired {
+                session_id: session_id.to_string(),
+                wrong,
+            }
+        }
+        None => DaemonToClient::Error { message: e.to_string() },
+    };
+    let _ = send_frame(tx, frame).await;
+}
+
 /// Read one NDJSON [`ClientToDaemon`] frame off a buffered stream. `Ok(None)`
 /// means the client closed (EOF).
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
@@ -683,6 +733,7 @@ fn to_wire_session_info(info: crate::registry::SessionInfo) -> WireSessionInfo {
         id: info.id,
         title: info.title,
         attached: info.attached_count,
+        protected: info.protected,
     }
 }
 
@@ -858,6 +909,8 @@ mod tests {
                 &(ClientToDaemon::AttachCreate {
                     session_id: sid.clone(),
                     cmd: Some("cat".into()),
+                    password: None,
+                    protect: false,
                 })
                 .to_frame()
                 .unwrap(),
@@ -949,6 +1002,8 @@ mod tests {
                 &(ClientToDaemon::AttachCreate {
                     session_id: "work-session".into(),
                     cmd: Some("sleep 30".into()),
+                    password: None,
+                    protect: false,
                 })
                 .to_frame()
                 .unwrap(),
@@ -989,6 +1044,8 @@ mod tests {
                 &(ClientToDaemon::AttachCreate {
                     session_id: "work-session".into(),
                     cmd: Some("echo RERUN".into()),
+                    password: None,
+                    protect: false,
                 })
                 .to_frame()
                 .unwrap(),
@@ -1063,6 +1120,8 @@ mod tests {
                 &(ClientToDaemon::AttachCreate {
                     session_id: "cwd-test".into(),
                     cmd: Some("sleep 30".into()),
+                    password: None,
+                    protect: false,
                 })
                 .to_frame()
                 .unwrap(),
@@ -1081,6 +1140,7 @@ mod tests {
             .write_all(
                 &(ClientToDaemon::Cwd {
                     session_id: "cwd-test".into(),
+                    password: None,
                 })
                 .to_frame()
                 .unwrap(),
@@ -1101,6 +1161,127 @@ mod tests {
             other => panic!("expected Cwd, got {other:?}"),
         }
 
+        daemon.abort();
+    }
+
+    // A protected session: created with `protect`, it is listed as protected,
+    // refuses attach/cwd/kill without its password (PasswordRequired, with
+    // `wrong` set after a bad guess, which is answered only after the delay),
+    // accepts the right one, and survives kill-all.
+    #[tokio::test]
+    async fn protected_session_requires_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_in(dir.path());
+        let daemon = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        async fn open(path: &Path) -> BufReader<TokioStream> {
+            let mut r = BufReader::new(connect_with_retry(path).await);
+            ask(&mut r, ClientToDaemon::Hello { version: PROTOCOL_VERSION }).await;
+            r
+        }
+        async fn ask(r: &mut BufReader<TokioStream>, frame: ClientToDaemon) -> DaemonToClient {
+            r.get_mut().write_all(&frame.to_frame().unwrap()).await.unwrap();
+            let mut line = String::new();
+            r.read_line(&mut line).await.unwrap();
+            DaemonToClient::from_frame(line.as_bytes()).unwrap()
+        }
+        let sock = dir.path().join("session.sock");
+        let required = |wrong| DaemonToClient::PasswordRequired {
+            session_id: "vault".into(),
+            wrong,
+        };
+
+        // Creating protected without a password is refused.
+        let mut owner = open(&sock).await;
+        let create = |password: Option<&str>| ClientToDaemon::AttachCreate {
+            session_id: "vault".into(),
+            cmd: Some("sleep 30".into()),
+            password: password.map(str::to_string),
+            protect: true,
+        };
+        assert!(matches!(ask(&mut owner, create(None)).await, DaemonToClient::Error { .. }));
+        assert!(matches!(
+            ask(&mut owner, create(Some("s3cret"))).await,
+            DaemonToClient::Attached { .. }
+        ));
+
+        let mut other = open(&sock).await;
+        match ask(&mut other, ClientToDaemon::List).await {
+            DaemonToClient::Listing { sessions } => {
+                assert_eq!(sessions.len(), 1);
+                assert!(sessions[0].protected, "listing must mark it protected");
+            }
+            f => panic!("expected Listing, got {f:?}"),
+        }
+        let attach = |password: Option<&str>| ClientToDaemon::Attach {
+            session_id: "vault".into(),
+            password: password.map(str::to_string),
+        };
+        assert_eq!(ask(&mut other, attach(None)).await, required(false));
+        let started = std::time::Instant::now();
+        assert_eq!(ask(&mut other, attach(Some("guess"))).await, required(true));
+        assert!(started.elapsed() >= WRONG_PASSWORD_DELAY, "a wrong guess is slowed down");
+        // The resume path (AttachCreate without protect) is guarded too.
+        let resume = ClientToDaemon::AttachCreate {
+            session_id: "vault".into(),
+            cmd: None,
+            password: None,
+            protect: false,
+        };
+        assert_eq!(ask(&mut other, resume).await, required(false));
+        let cwd = ClientToDaemon::Cwd {
+            session_id: "vault".into(),
+            password: None,
+        };
+        assert_eq!(ask(&mut other, cwd).await, required(false));
+        let rename = ClientToDaemon::Rename {
+            from: "vault".into(),
+            to: "x".into(),
+            password: None,
+        };
+        assert_eq!(ask(&mut other, rename).await, required(false));
+        let kill = |password: Option<&str>| ClientToDaemon::Kill {
+            session_id: "vault".into(),
+            password: password.map(str::to_string),
+        };
+        assert_eq!(ask(&mut other, kill(None)).await, required(false));
+        match ask(&mut other, ClientToDaemon::KillAll).await {
+            DaemonToClient::Error { message } => assert!(message.contains("except 1"), "{message}"),
+            f => panic!("expected the kill-all ack, got {f:?}"),
+        }
+        assert!(matches!(
+            ask(&mut other, attach(Some("s3cret"))).await,
+            DaemonToClient::Attached { .. }
+        ));
+
+        // An existing unprotected name can't be "protected" by a second create.
+        let mut third = open(&sock).await;
+        let plain = ClientToDaemon::AttachCreate {
+            session_id: "plain".into(),
+            cmd: Some("sleep 30".into()),
+            password: None,
+            protect: false,
+        };
+        assert!(matches!(ask(&mut third, plain).await, DaemonToClient::Attached { .. }));
+        let mut fourth = open(&sock).await;
+        let reprotect = ClientToDaemon::AttachCreate {
+            session_id: "plain".into(),
+            cmd: None,
+            password: Some("pw".into()),
+            protect: true,
+        };
+        match ask(&mut fourth, reprotect).await {
+            DaemonToClient::Error { message } => assert!(message.contains("without a password")),
+            f => panic!("expected an Error, got {f:?}"),
+        }
+
+        let mut killer = open(&sock).await;
+        assert_eq!(
+            ask(&mut killer, kill(Some("s3cret"))).await,
+            DaemonToClient::Killed { session_id: "vault".into() }
+        );
         daemon.abort();
     }
 }

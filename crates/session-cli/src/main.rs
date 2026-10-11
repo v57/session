@@ -20,6 +20,9 @@
 //! * `session <name> <cmd...>` -> start that named session running `cmd`, then
 //!                                attach; if the name is already live, `cmd` is
 //!                                ignored (resume).
+//! * `session -p <name> [cmd...]` -> the same, but a new session gets a password
+//!                                (see [`password`]). Any command on a protected
+//!                                session asks for its password.
 //! * `session --daemon`        -> run the daemon loop (via session-core).
 //!
 //! The management subcommands (list/kill/kill-all/detach) route to the
@@ -35,6 +38,7 @@ use std::process::ExitCode;
 
 mod client;
 mod daemon_launcher;
+mod password;
 mod proxy;
 
 /// Exit code for a usage error (bad arguments, unknown subcommand shape).
@@ -62,8 +66,12 @@ enum Command {
     Detach,
     /// `session attach <uuid>` (attach to an existing session)
     Attach { id: String },
-    /// `session <uuid> [cmd...]`
-    AttachOrCreate { id: String, cmd: Option<String> },
+    /// `session [-p] <uuid> [cmd...]`; `protect` gives a new session a password.
+    AttachOrCreate {
+        id: String,
+        cmd: Option<String>,
+        protect: bool,
+    },
     /// Help request (-h / --help / help).
     Help,
     /// No recognizable command (usage).
@@ -108,9 +116,9 @@ fn main() -> ExitCode {
         // The attach subcommands route to the raw-mode proxy. `proxy::attach` is a
         // self-contained, sync entry point that builds its OWN runtime, so it must
         // NOT be called from inside `rt.block_on` (that would nest a runtime).
-        Command::Attach { id } => run_attach_sync(&Config::load(), &id, None, false),
-        Command::AttachOrCreate { id, cmd } => {
-            run_attach_sync(&Config::load(), &id, cmd.as_deref(), true)
+        Command::Attach { id } => run_attach_sync(&Config::load(), &id, None, false, false),
+        Command::AttachOrCreate { id, cmd, protect } => {
+            run_attach_sync(&Config::load(), &id, cmd.as_deref(), true, protect)
         }
     }
 }
@@ -155,6 +163,15 @@ fn parse_command(rest: &[String]) -> Command {
             Some(name) => Command::Cwd { name: name.clone() },
             None => Command::Usage,
         },
+        // `-p <name> [cmd...]` is attach-or-create with a password.
+        "-p" => match rest.get(1) {
+            Some(name) if !name.starts_with('-') => Command::AttachOrCreate {
+                id: name.clone(),
+                cmd: join_cmd(&rest[2..]),
+                protect: true,
+            },
+            _ => Command::Usage,
+        },
         "detach" => Command::Detach,
         // `create` is intentionally NOT a command. Sessions are started with
         // `session <name> [cmd...]`. Reserve it so a stray `session create`
@@ -170,6 +187,7 @@ fn parse_command(rest: &[String]) -> Command {
         _ => Command::AttachOrCreate {
             id: cmd.clone(),
             cmd: join_cmd(&rest[1..]),
+            protect: false,
         },
     }
 }
@@ -195,7 +213,30 @@ fn print_usage(prog: &str) {
     eprintln!("  -d <name>                  print the session's working directory");
     eprintln!("  attach <uuid>              attach to an existing session");
     eprintln!("  <name> [cmd...]            attach-or-create; cmd runs if the name is new");
+    eprintln!("  -p <name> [cmd...]         the same, but a new session gets a password");
     eprintln!("  --daemon                   run the session daemon loop");
+    eprintln!("password-protected sessions ask for their password; set {} to skip the prompt", password::ENV);
+}
+
+/// Send a request about `session`. When the daemon answers `PasswordRequired`,
+/// get the password ([`password::Asker`]) and send the request again with it.
+/// Returns the daemon's first other reply (`None`: the daemon closed).
+async fn request(
+    client: &mut Client,
+    session: &str,
+    frame: impl Fn(Option<String>) -> ClientToDaemon,
+) -> anyhow::Result<Option<DaemonToClient>> {
+    let mut asker = password::Asker::from_env();
+    let mut password = None;
+    loop {
+        client.send(frame(password.take())).await?;
+        match client.recv().await? {
+            Some(DaemonToClient::PasswordRequired { wrong, .. }) => {
+                password = Some(asker.existing(session, wrong)?)
+            }
+            reply => return Ok(reply),
+        }
+    }
 }
 
 /// Connect to (or auto-start) the daemon and return a handshaked client.
@@ -257,31 +298,29 @@ async fn cmd_kill(id: String) -> ExitCode {
             return ExitCode::from(EXIT_ERROR);
         }
     };
-    if let Err(e) = client.send(ClientToDaemon::Kill { session_id: id }).await {
-        eprintln!("session: failed to send kill: {e}");
-        return ExitCode::from(EXIT_ERROR);
-    }
-    loop {
-        match client.recv().await {
-            Ok(Some(DaemonToClient::Killed { session_id })) => {
-                println!("session: killed {session_id}");
-                return ExitCode::SUCCESS;
-            }
-            Ok(Some(DaemonToClient::Error { message })) => {
-                eprintln!("session: {message}");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                eprintln!("session: daemon closed the connection");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Err(e) => {
-                eprintln!("session: {e}");
-                return ExitCode::from(EXIT_ERROR);
-            }
+    let reply = request(&mut client, &id, |password| ClientToDaemon::Kill {
+        session_id: id.clone(),
+        password,
+    })
+    .await;
+    match reply {
+        Ok(Some(DaemonToClient::Killed { session_id })) => {
+            println!("session: killed {session_id}");
+            ExitCode::SUCCESS
         }
+        other => report_failure(other),
     }
+}
+
+/// Print why a request did not get its expected reply; exit code 1.
+fn report_failure(reply: anyhow::Result<Option<DaemonToClient>>) -> ExitCode {
+    match reply {
+        Ok(Some(DaemonToClient::Error { message })) => eprintln!("session: {message}"),
+        Ok(Some(other)) => eprintln!("session: unexpected reply from the daemon: {other:?}"),
+        Ok(None) => eprintln!("session: daemon closed the connection"),
+        Err(e) => eprintln!("session: {e}"),
+    }
+    ExitCode::from(EXIT_ERROR)
 }
 
 /// `session kill-all` — kill every session. The protocol acks via a purely
@@ -326,30 +365,17 @@ async fn cmd_cwd(name: String) -> ExitCode {
             return ExitCode::from(EXIT_ERROR);
         }
     };
-    if let Err(e) = client.send(ClientToDaemon::Cwd { session_id: name }).await {
-        eprintln!("session: failed to request cwd: {e}");
-        return ExitCode::from(EXIT_ERROR);
-    }
-    loop {
-        match client.recv().await {
-            Ok(Some(DaemonToClient::Cwd { cwd, .. })) => {
-                println!("{cwd}");
-                return ExitCode::SUCCESS;
-            }
-            Ok(Some(DaemonToClient::Error { message })) => {
-                eprintln!("session: {message}");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                eprintln!("session: daemon closed the connection");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Err(e) => {
-                eprintln!("session: {e}");
-                return ExitCode::from(EXIT_ERROR);
-            }
+    let reply = request(&mut client, &name, |password| ClientToDaemon::Cwd {
+        session_id: name.clone(),
+        password,
+    })
+    .await;
+    match reply {
+        Ok(Some(DaemonToClient::Cwd { cwd, .. })) => {
+            println!("{cwd}");
+            ExitCode::SUCCESS
         }
+        other => report_failure(other),
     }
 }
 
@@ -364,36 +390,18 @@ async fn cmd_rename(from: String, to: String) -> ExitCode {
             return ExitCode::from(EXIT_ERROR);
         }
     };
-    if let Err(e) = client
-        .send(ClientToDaemon::Rename {
-            from: from.clone(),
-            to: to.clone(),
-        })
-        .await
-    {
-        eprintln!("session: failed to send rename: {e}");
-        return ExitCode::from(EXIT_ERROR);
-    }
-    loop {
-        match client.recv().await {
-            Ok(Some(DaemonToClient::Renamed { session_id })) => {
-                println!("session: renamed {from} to {session_id}");
-                return ExitCode::SUCCESS;
-            }
-            Ok(Some(DaemonToClient::Error { message })) => {
-                eprintln!("session: {message}");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                eprintln!("session: daemon closed the connection");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            Err(e) => {
-                eprintln!("session: {e}");
-                return ExitCode::from(EXIT_ERROR);
-            }
+    let reply = request(&mut client, &from, |password| ClientToDaemon::Rename {
+        from: from.clone(),
+        to: to.clone(),
+        password,
+    })
+    .await;
+    match reply {
+        Ok(Some(DaemonToClient::Renamed { session_id })) => {
+            println!("session: renamed {from} to {session_id}");
+            ExitCode::SUCCESS
         }
+        other => report_failure(other),
     }
 }
 
@@ -423,7 +431,13 @@ async fn cmd_detach() -> ExitCode {
 /// runtime that is dropped BEFORE `proxy::attach` is called, so the daemon is up
 /// and the proxy sees a listener. The daemon and session always survive the
 /// client detaching.
-fn run_attach_sync(cfg: &Config, session: &str, cmd: Option<&str>, create: bool) -> ExitCode {
+fn run_attach_sync(
+    cfg: &Config,
+    session: &str,
+    cmd: Option<&str>,
+    create: bool,
+    protect: bool,
+) -> ExitCode {
     // Auto-start the daemon (spawns a detached `session --daemon`) so the proxy's
     // `Conn::connect` finds a listener. The temporary runtime is dropped before
     // `proxy::attach` creates its own.
@@ -441,7 +455,11 @@ fn run_attach_sync(cfg: &Config, session: &str, cmd: Option<&str>, create: bool)
         }
     }
 
-    match proxy::attach(cfg, session, cmd, create, proxy::ProxyOptions::default()) {
+    let opts = proxy::ProxyOptions {
+        protect,
+        ..proxy::ProxyOptions::default()
+    };
+    match proxy::attach(cfg, session, cmd, create, opts) {
         Ok(_exit) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("session: {e}");
@@ -546,7 +564,8 @@ mod tests {
             parse_command(&[s("s1"), s("ls"), s("-la")]),
             Command::AttachOrCreate {
                 id: s("s1"),
-                cmd: Some(s("ls -la"))
+                cmd: Some(s("ls -la")),
+                protect: false,
             }
         );
     }
@@ -557,7 +576,8 @@ mod tests {
             parse_command(&[s("some-uuid")]),
             Command::AttachOrCreate {
                 id: s("some-uuid"),
-                cmd: None
+                cmd: None,
+                protect: false,
             }
         );
     }
@@ -568,9 +588,32 @@ mod tests {
             parse_command(&[s("nonsense")]),
             Command::AttachOrCreate {
                 id: s("nonsense"),
-                cmd: None
+                cmd: None,
+                protect: false,
             }
         );
+    }
+
+    #[test]
+    fn dash_p_is_attach_or_create_with_a_password() {
+        assert_eq!(
+            parse_command(&[s("-p"), s("work")]),
+            Command::AttachOrCreate {
+                id: s("work"),
+                cmd: None,
+                protect: true,
+            }
+        );
+        assert_eq!(
+            parse_command(&[s("-p"), s("work"), s("top")]),
+            Command::AttachOrCreate {
+                id: s("work"),
+                cmd: Some(s("top")),
+                protect: true,
+            }
+        );
+        assert_eq!(parse_command(&[s("-p")]), Command::Usage);
+        assert_eq!(parse_command(&[s("-p"), s("-d")]), Command::Usage);
     }
 
     #[test]

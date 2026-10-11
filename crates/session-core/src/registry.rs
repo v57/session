@@ -13,6 +13,7 @@ use crate::session::{AttachHandle, ClientId, Session};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 /// Lifecycle status of a session, reported by [`Registry::list`].
@@ -36,6 +37,8 @@ pub struct SessionInfo {
     /// Number of currently-attached clients.
     pub attached_count: usize,
     pub status: SessionStatus,
+    /// Whether the session is password protected.
+    pub protected: bool,
 }
 
 /// The daemon's map of live sessions, keyed by id.
@@ -135,12 +138,50 @@ impl Registry {
         Ok(())
     }
 
-    /// Kill every session and clear the registry.
-    pub fn kill_all(&mut self) {
-        for session in self.sessions.values_mut() {
-            session.kill();
+    /// Require `password` for this session from now on.
+    pub fn protect(&mut self, id: &str, password: &str) -> anyhow::Result<()> {
+        if password.is_empty() {
+            return Err(anyhow::anyhow!("the password must not be empty"));
         }
-        self.sessions.clear();
+        self.sessions
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?
+            .protect(password);
+        Ok(())
+    }
+
+    /// Whether the session exists and is password protected.
+    pub fn is_protected(&self, id: &str) -> bool {
+        self.sessions.get(id).is_some_and(|s| s.protection().is_some())
+    }
+
+    /// Check `password` for a request on session `id`. Passes for unprotected
+    /// and unknown sessions (the request itself then reports "no such
+    /// session"); otherwise fails with a [`Denied`] the daemon can downcast.
+    pub fn authorize(&self, id: &str, password: Option<&str>) -> anyhow::Result<()> {
+        match self.sessions.get(id).and_then(|s| s.protection()) {
+            Some(protection) => Ok(protection.check(password)?),
+            None => Ok(()),
+        }
+    }
+
+    /// The lock that password attempts on session `id` take turns on, if it is
+    /// protected.
+    pub fn password_turn(&self, id: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.sessions.get(id)?.protection().map(|p| p.turn())
+    }
+
+    /// Kill every session that is not password protected; protected ones need
+    /// `kill <name>` with their password. Returns how many were left running.
+    pub fn kill_all(&mut self) -> usize {
+        self.sessions.retain(|_, session| {
+            if session.protection().is_some() {
+                return true;
+            }
+            session.kill();
+            false
+        });
+        self.sessions.len()
     }
 
     /// Remove a session without killing its child (for callers that already
@@ -190,6 +231,7 @@ impl Registry {
                 } else {
                     SessionStatus::Running
                 },
+                protected: s.protection().is_some(),
             })
             .collect();
         infos.sort_by_key(|i| (i.created, i.id.clone()));
@@ -271,6 +313,42 @@ mod tests {
 
         reg.kill_all();
         assert!(reg.is_empty());
+    }
+
+    // A protected session refuses requests without its password, reports
+    // `protected` in the listing, and survives kill-all.
+    #[tokio::test]
+    async fn protected_session_needs_its_password() {
+        use crate::password::Denied;
+        let mut reg = Registry::new(2000);
+        reg.create_session("open", Some(shell_argv("cat"))).expect("create open");
+        reg.create_session("locked", Some(shell_argv("cat"))).expect("create locked");
+        assert!(reg.protect("locked", "").is_err(), "empty password is refused");
+        reg.protect("locked", "pw").expect("protect");
+
+        assert!(reg.is_protected("locked"));
+        assert!(!reg.is_protected("open"));
+        let denied = |r: anyhow::Result<()>| r.unwrap_err().downcast::<Denied>().ok();
+        assert_eq!(denied(reg.authorize("locked", None)), Some(Denied::Required));
+        assert_eq!(denied(reg.authorize("locked", Some("nope"))), Some(Denied::Wrong));
+        assert!(reg.authorize("locked", Some("pw")).is_ok());
+        assert!(reg.authorize("open", None).is_ok());
+        assert!(reg.authorize("missing", None).is_ok());
+        assert!(reg.password_turn("locked").is_some());
+        assert!(reg.password_turn("open").is_none());
+
+        let listed: Vec<(String, bool)> =
+            reg.list().into_iter().map(|i| (i.id, i.protected)).collect();
+        assert!(listed.contains(&("locked".to_string(), true)));
+        assert!(listed.contains(&("open".to_string(), false)));
+
+        // Rename keeps the protection with the session.
+        reg.rename("locked", "renamed").expect("rename");
+        assert!(reg.is_protected("renamed"));
+
+        assert_eq!(reg.kill_all(), 1, "the protected session is left running");
+        assert!(reg.contains("renamed"));
+        reg.kill("renamed").unwrap();
     }
 
     // Killing an unknown id is an error, not a panic.

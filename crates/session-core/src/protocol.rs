@@ -17,7 +17,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// v2: added [`DaemonToClient::Exit`] so a client is told when its session's
 /// child process exits and can close instead of lingering in raw mode.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3: added session passwords (`password` on Attach, AttachCreate, Kill,
+/// Rename and Cwd, `protect` on AttachCreate, [`DaemonToClient::PasswordRequired`]).
+/// A v2 daemon would silently ignore them and create an unprotected session,
+/// so the version is bumped instead of relying on unknown-field leniency.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A frame from the client (the CLI / proxy) to the daemon.
 ///
@@ -29,13 +34,26 @@ pub enum ClientToDaemon {
     /// Client announces its protocol version and (implicitly) opens a session.
     Hello { version: u32 },
     /// Client attaches to an already-existing session by id.
-    Attach { session_id: String },
+    Attach {
+        session_id: String,
+        /// The session's password, when it is protected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
     /// Client creates a new session (optionally running `cmd`), then attaches.
     AttachCreate {
         session_id: String,
         /// Optional command to run in the session; `None` = default shell.
         #[serde(skip_serializing_if = "Option::is_none")]
         cmd: Option<String>,
+        /// The password: checked when the session already exists and is
+        /// protected, and set as its password when `protect` creates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        /// Create the session password protected (`password` is required).
+        /// Refused when the name is already live without a password.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        protect: bool,
     },
     /// Raw input bytes (keystrokes) to feed to the session's pty.
     Input {
@@ -49,18 +67,35 @@ pub enum ClientToDaemon {
     /// Client requests the list of live sessions.
     List,
     /// Client requests that one session be killed.
-    Kill { session_id: String },
-    /// Client requests that all sessions be killed.
+    Kill {
+        session_id: String,
+        /// The session's password, when it is protected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
+    /// Client requests that all sessions be killed. Password-protected
+    /// sessions are left running (kill them one by one with their password).
     KillAll,
     /// Client renames a live session (`from` -> `to`). Refused by the daemon
     /// when `from` is unknown, `to` is already live, or the session has
     /// attached clients (each client connection binds to the name it attached
     /// with; renaming under an attached client would strand its input
     /// routing). Headless — needs no TTY.
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+        /// The password of `from`, when it is protected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
     /// Client requests the working directory of a session (the Shell app uses
     /// this to follow the shell's `cd` for file-drop / file-manager mode).
-    Cwd { session_id: String },
+    Cwd {
+        session_id: String,
+        /// The session's password, when it is protected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
 }
 
 /// A frame from the daemon back to a client.
@@ -96,6 +131,10 @@ pub enum DaemonToClient {
     Error { message: String },
     /// The requested session's current working directory.
     Cwd { session_id: String, cwd: String },
+    /// The request names a password-protected session and sent no password
+    /// (`wrong == false`) or a wrong one (`wrong == true`). The client may ask
+    /// the user and send the same request again with `password`.
+    PasswordRequired { session_id: String, wrong: bool },
 }
 
 /// Metadata about one live session, as reported by [`DaemonToClient::Listing`].
@@ -109,6 +148,9 @@ pub struct SessionInfo {
     /// Number of currently attached clients.
     #[serde(default)]
     pub attached: usize,
+    /// Whether attaching (and kill, rename, cwd) needs the session's password.
+    #[serde(default)]
+    pub protected: bool,
 }
 
 impl SessionInfo {
@@ -117,6 +159,7 @@ impl SessionInfo {
             id: id.into(),
             title: String::new(),
             attached: 0,
+            protected: false,
         }
     }
 }
@@ -325,14 +368,23 @@ mod tests {
         });
         roundtrip_frame(&ClientToDaemon::Attach {
             session_id: "s1".into(),
+            password: None,
+        });
+        roundtrip_frame(&ClientToDaemon::Attach {
+            session_id: "s1".into(),
+            password: Some("pw".into()),
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s2".into(),
             cmd: Some("bash".into()),
+            password: None,
+            protect: false,
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s3".into(),
             cmd: None,
+            password: Some("pw".into()),
+            protect: true,
         });
         roundtrip_frame(&ClientToDaemon::Input {
             bytes: vec![0x1b, b'[', b'2', b'J'],
@@ -342,14 +394,17 @@ mod tests {
         roundtrip_frame(&ClientToDaemon::List);
         roundtrip_frame(&ClientToDaemon::Kill {
             session_id: "s9".into(),
+            password: Some("pw".into()),
         });
         roundtrip_frame(&ClientToDaemon::KillAll);
         roundtrip_frame(&ClientToDaemon::Rename {
             from: "old".into(),
             to: "new".into(),
+            password: None,
         });
         roundtrip_frame(&ClientToDaemon::Cwd {
             session_id: "s5".into(),
+            password: Some("pw".into()),
         });
     }
 
@@ -381,6 +436,7 @@ mod tests {
                     id: "s2".into(),
                     title: "vim".into(),
                     attached: 2,
+                    protected: true,
                 },
             ],
         });
@@ -391,6 +447,31 @@ mod tests {
             session_id: "s5".into(),
             cwd: "/Users/v57/projects".into(),
         });
+        roundtrip_frame(&DaemonToClient::PasswordRequired {
+            session_id: "s5".into(),
+            wrong: true,
+        });
+    }
+
+    // Password fields are optional on the wire: a frame without them (an
+    // unprotected request) still decodes, and they are omitted when unset.
+    #[test]
+    fn password_fields_are_optional_on_the_wire() {
+        let frame = ClientToDaemon::from_frame(br#"{"type":"AttachCreate","data":{"session_id":"s"}}"#)
+            .unwrap();
+        assert_eq!(
+            frame,
+            ClientToDaemon::AttachCreate {
+                session_id: "s".into(),
+                cmd: None,
+                password: None,
+                protect: false,
+            }
+        );
+        let json = String::from_utf8(frame.to_frame().unwrap()).unwrap();
+        assert!(!json.contains("password") && !json.contains("protect"), "{json}");
+        let info: SessionInfo = serde_json::from_str(r#"{"id":"s"}"#).unwrap();
+        assert!(!info.protected);
     }
 
     #[test]
@@ -398,6 +479,7 @@ mod tests {
         let frames = vec![
             ClientToDaemon::Attach {
                 session_id: "s1".into(),
+                password: None,
             },
             ClientToDaemon::Resize {
                 rows: 24,

@@ -39,6 +39,7 @@
 //! the replay snapshot).
 
 use crate::emulator::Emulator;
+use crate::password::Protection;
 use crate::pty::Pty;
 use crate::winsize::Winsize;
 use portable_pty::ExitStatus as PtyExitStatus;
@@ -105,6 +106,8 @@ pub struct Session {
     clients: StdMutex<Vec<Client>>,
     exited: Arc<AtomicBool>,
     exit_status: Arc<StdMutex<Option<PtyExitStatus>>>,
+    /// Set when the session is password protected.
+    protection: Option<Protection>,
 }
 
 impl Session {
@@ -156,6 +159,7 @@ impl Session {
             clients: StdMutex::new(Vec::new()),
             exited,
             exit_status,
+            protection: None,
         })
     }
 
@@ -180,6 +184,16 @@ impl Session {
     /// When the session was created.
     pub fn create_time(&self) -> SystemTime {
         self.create_time
+    }
+
+    /// Require `password` for attach, kill, rename and cwd from now on.
+    pub fn protect(&mut self, password: &str) {
+        self.protection = Some(Protection::new(password));
+    }
+
+    /// The session's password protection, if it has one.
+    pub fn protection(&self) -> Option<&Protection> {
+        self.protection.as_ref()
     }
 
     /// The child command the session runs (used as its display title).

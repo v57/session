@@ -12,6 +12,7 @@ pub mod config;
 pub mod cwd;
 pub mod daemon;
 pub mod emulator;
+pub mod password;
 pub mod protocol;
 pub mod pty;
 pub mod registry;

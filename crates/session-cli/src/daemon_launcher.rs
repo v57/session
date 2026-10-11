@@ -51,6 +51,8 @@ impl DaemonSpawner for CommandSpawner {
         let exe = std::env::current_exe().context("resolve own binary path")?;
         let mut cmd = Command::new(exe);
         cmd.arg("--daemon")
+            // Sessions inherit the daemon's environment: never the password.
+            .env_remove(crate::password::ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -88,9 +90,18 @@ async fn ensure_daemon_with_timeout<S: DaemonSpawner>(
         Ok(client) => return Ok(client),
         // Socket absent / stale corpse / refused: a daemon is NOT up -> start one.
         Err(ConnectError::Io(_)) => {}
+        Err(ConnectError::Version(e)) => {
+            // A daemon from another session release is running. Starting a
+            // second one would orphan its sessions; tell the user instead.
+            bail!(
+                "a session daemon from another version is running ({e}). Its sessions keep \
+                 running; to switch, end them and that daemon (e.g. `pkill -f 'session --daemon'`, \
+                 or end session.exe in Task Manager on Windows), then run this again"
+            );
+        }
         Err(e) => {
-            // A daemon IS present but uncooperative (wrong version / broken
-            // handshake). Do NOT mask that by starting a second one.
+            // A daemon IS present but uncooperative (broken handshake). Do NOT
+            // mask that by starting a second one.
             bail!(
                 "daemon at {} is running but unresponsive: {e}",
                 config.socket_path.display()
