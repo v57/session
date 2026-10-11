@@ -45,11 +45,7 @@
 #![allow(dead_code)]
 
 use anyhow::anyhow;
-use interprocess::local_socket::{
-    tokio::prelude::*,
-    tokio::Stream as TokioStream,
-    GenericFilePath, ToFsName,
-};
+use interprocess::local_socket::{tokio::prelude::*, tokio::Stream as TokioStream};
 use session_core::config::Config;
 use session_core::protocol::{check_version, ClientToDaemon, DaemonToClient, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -108,10 +104,7 @@ impl Conn {
     /// Connect to the daemon at `config.socket_path`, complete the `Hello`
     /// handshake, and split the socket into its read/write halves.
     async fn connect(config: &Config) -> anyhow::Result<Conn> {
-        let name = config
-            .socket_path
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
+        let name = session_core::config::socket_name(&config.socket_path)
             .map_err(|e| anyhow!("invalid socket path {}: {e}", config.socket_path.display()))?;
         let stream = TokioStream::connect(name)
             .await
@@ -595,7 +588,7 @@ fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHa
 mod tests {
     use super::*;
     use crate::password::Asker;
-    use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
+    use interprocess::local_socket::ListenerOptions;
     use session_core::config::Config;
     use std::path::Path;
     use std::time::Duration;
@@ -614,7 +607,7 @@ mod tests {
     // as an Output frame (so the daemon->stdout direction is observable). Frames
     // are pushed to the returned receiver for the test to assert on.
     async fn spawn_fake_daemon(sock: &Path) -> mpsc::UnboundedReceiver<ClientToDaemon> {
-        let name = sock.to_fs_name::<GenericFilePath>().unwrap();
+        let name = session_core::config::socket_name(sock).unwrap();
         let listener = ListenerOptions::new()
             .name(name)
             .try_overwrite(true)
@@ -881,7 +874,7 @@ mod tests {
     async fn proxy_closes_on_daemon_exit() {
         let dir = tempdir().unwrap();
         let cfg = temp_config(&dir);
-        let name = cfg.socket_path.clone().to_fs_name::<GenericFilePath>().unwrap();
+        let name = session_core::config::socket_name(&cfg.socket_path).unwrap();
         let listener = ListenerOptions::new()
             .name(name)
             .try_overwrite(true)
@@ -964,7 +957,7 @@ mod tests {
     async fn open_session_answers_a_password_challenge() {
         let dir = tempdir().unwrap();
         let cfg = temp_config(&dir);
-        let name = cfg.socket_path.clone().to_fs_name::<GenericFilePath>().unwrap();
+        let name = session_core::config::socket_name(&cfg.socket_path).unwrap();
         let listener = ListenerOptions::new()
             .name(name)
             .try_overwrite(true)

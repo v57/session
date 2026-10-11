@@ -78,7 +78,7 @@ use anyhow::Result;
 use interprocess::local_socket::{
     tokio::prelude::*,
     tokio::Stream as TokioStream,
-    GenericFilePath, ListenerOptions, ToFsName,
+    ListenerOptions,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -163,9 +163,7 @@ pub async fn run(config: Config) -> Result<()> {
     // Bind. `try_overwrite` + interprocess name reclamation let us re-take a
     // stale socket file left by a previously-crashed instance.
     let socket_path = config.socket_path.clone();
-    let name = socket_path
-        .as_path()
-        .to_fs_name::<GenericFilePath>()
+    let name = crate::config::socket_name(&socket_path)
         .map_err(|e| anyhow::anyhow!("bad socket path {}: {e}", socket_path.display()))?;
     let listener = ListenerOptions::new()
         .name(name)
@@ -231,7 +229,7 @@ fn ensure_working_dir() -> Result<()> {
 /// running; anything else (connect failure, wrong peer, no response) means the
 /// caller should become the daemon.
 async fn probe_alive(socket_path: &Path) -> Result<bool> {
-    let name = match socket_path.to_fs_name::<GenericFilePath>() {
+    let name = match crate::config::socket_name(socket_path) {
         Ok(n) => n,
         Err(_) => return Ok(false),
     };
@@ -760,7 +758,7 @@ mod tests {
     async fn connect_with_retry(path: &Path) -> TokioStream {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match path.to_fs_name::<GenericFilePath>() {
+            match crate::config::socket_name(path) {
                 Ok(name) => match TokioStream::connect(name).await {
                     Ok(s) => return s,
                     Err(_) if std::time::Instant::now() < deadline => {

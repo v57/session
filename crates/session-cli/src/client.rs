@@ -12,11 +12,7 @@
 //! [`interprocess`] local-stream backend (unix socket on macOS/Linux, named
 //! pipe on Windows), so this client can join any daemon the engine starts.
 
-use interprocess::local_socket::{
-    tokio::prelude::*,
-    tokio::Stream as TokioStream,
-    GenericFilePath, ToFsName,
-};
+use interprocess::local_socket::{tokio::prelude::*, tokio::Stream as TokioStream};
 use session_core::config::Config;
 use session_core::protocol::{check_version, ClientToDaemon, DaemonToClient, PROTOCOL_VERSION};
 use std::time::Duration;
@@ -69,10 +65,7 @@ impl Client {
     /// handshake (advertise our version, verify the daemon's).
     pub async fn connect(config: &Config) -> Result<Self, ConnectError> {
         // Resolve the socket path into an interprocess filesystem socket name.
-        let name = config
-            .socket_path
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
+        let name = session_core::config::socket_name(&config.socket_path)
             .map_err(|e| {
                 ConnectError::Io(format!("invalid socket path {}: {e}", config.socket_path.display()))
             })?;

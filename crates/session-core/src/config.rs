@@ -10,7 +10,8 @@
 //! Scrollback cap and idle policy are baked-in defaults the user may flip via an
 //! optional JSON config file (see [`Config::load`]).
 
-use std::path::PathBuf;
+use interprocess::local_socket::{GenericFilePath, Name, ToFsName};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default scrollback lines each session's emulator retains.
@@ -101,6 +102,33 @@ fn default_socket_dir() -> PathBuf {
     base.join("session")
 }
 
+/// The local-socket name the daemon listens on and clients connect to for
+/// `socket_path`.
+///
+/// On Unix that is the socket file itself. On Windows local sockets are named
+/// pipes, which live under `\\.\pipe\`, not in the filesystem (a file path is
+/// refused as "not a named pipe path"), so the pipe is named after the path:
+/// each user's path, and each test's temp dir, gets its own pipe.
+pub fn socket_name(socket_path: &Path) -> std::io::Result<Name<'static>> {
+    #[cfg(windows)]
+    let name = pipe_path(socket_path);
+    #[cfg(not(windows))]
+    let name = socket_path.to_path_buf();
+    name.to_fs_name::<GenericFilePath>()
+}
+
+/// `\\.\pipe\` + `socket_path` with its separators turned into `-` (a pipe
+/// name can hold any character but a backslash).
+#[cfg(any(windows, test))]
+fn pipe_path(socket_path: &Path) -> String {
+    let flat: String = socket_path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '\\' || c == '/' { '-' } else { c })
+        .collect();
+    format!(r"\\.\pipe\{flat}")
+}
+
 /// Path to the optional config file, if the platform has a config dir.
 fn config_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("session").join(CONFIG_FILE_NAME))
@@ -121,6 +149,16 @@ mod tests {
             cfg.socket_path.file_name().and_then(|f| f.to_str()),
             Some(DEFAULT_SOCKET_NAME)
         );
+    }
+
+    #[test]
+    fn pipe_path_flattens_the_socket_path() {
+        assert_eq!(
+            pipe_path(Path::new(r"C:\Users\v57\AppData\Local\session\session.sock")),
+            r"\\.\pipe\C:-Users-v57-AppData-Local-session-session.sock"
+        );
+        // The real name resolves on every platform.
+        assert!(socket_name(&Config::default().socket_path).is_ok());
     }
 
     #[test]
