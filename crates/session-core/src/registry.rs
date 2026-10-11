@@ -257,17 +257,9 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
-    fn shell_argv(snippet: &str) -> Vec<OsString> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        vec![
-            OsString::from(shell),
-            OsString::from("-c"),
-            OsString::from(snippet),
-        ]
-    }
+    use crate::testing::shell as shell_argv;
 
     // GATE: create -> list -> kill round-trip on a real shell child.
     #[tokio::test]
@@ -299,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn custom_cmd_create_attach_kill_all() {
         let mut reg = Registry::new(2000);
-        reg.create_session("cat-session", Some(shell_argv("cat"))).expect("create cat");
+        reg.create_session("cat-session", Some(crate::testing::echo())).expect("create cat");
 
         let handle = reg.attach("cat-session", "client-a".into()).expect("attach");
         let _redraw = handle.redraw;
@@ -321,8 +313,8 @@ mod tests {
     async fn protected_session_needs_its_password() {
         use crate::password::Denied;
         let mut reg = Registry::new(2000);
-        reg.create_session("open", Some(shell_argv("cat"))).expect("create open");
-        reg.create_session("locked", Some(shell_argv("cat"))).expect("create locked");
+        reg.create_session("open", Some(crate::testing::echo())).expect("create open");
+        reg.create_session("locked", Some(crate::testing::echo())).expect("create locked");
         assert!(reg.protect("locked", "").is_err(), "empty password is refused");
         reg.protect("locked", "pw").expect("protect");
 

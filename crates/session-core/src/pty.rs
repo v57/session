@@ -329,20 +329,15 @@ mod unix_sig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    // GATE: spawn `$SHELL -c 'echo hi'`, read the output bytes, then resize to a
+    // GATE: spawn `echo hi` in the shell, read the output bytes, then resize to a
     // new size and assert no error. Also confirms the read-back size and that
     // the child's exit status is observed.
     #[test]
     fn spawn_read_resize_and_exit() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let argv = vec![
-            OsString::from(shell),
-            OsString::from("-c"),
-            OsString::from("echo hi"),
-        ];
+        let argv = crate::testing::shell("echo hi");
         let mut pty = Pty::spawn(Some(argv)).expect("spawn pty");
+        pty.write(crate::testing::CURSOR_REPLY).expect("answer ConPTY");
 
         // Read output until we've seen "hi" or the stream closes.
         let mut got: Vec<u8> = Vec::new();

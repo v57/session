@@ -1207,7 +1207,7 @@ mod tests {
             .expect("open pty");
         let mut child = pair
             .slave
-            .spawn_command(CommandBuilder::new("/bin/sh"))
+            .spawn_command(CommandBuilder::new(if cfg!(windows) { "cmd" } else { "/bin/sh" }))
             .expect("spawn shell");
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let mut writer = pair.master.take_writer().expect("writer");
@@ -1235,8 +1235,9 @@ mod tests {
 
         // Give the shell a fraction of a second, then drive it from the PTY.
         std::thread::sleep(std::time::Duration::from_millis(400));
+        writer.write_all(crate::testing::CURSOR_REPLY).expect("answer ConPTY");
         writer
-            .write_all(b"echo __SESS_PROBE_123__\n")
+            .write_all(b"echo __SESS_PROBE_123__\r")
             .expect("write cmd");
         writer.flush().expect("flush");
 

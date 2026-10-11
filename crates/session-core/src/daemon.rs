@@ -906,7 +906,7 @@ mod tests {
             .write_all(
                 &(ClientToDaemon::AttachCreate {
                     session_id: sid.clone(),
-                    cmd: Some("cat".into()),
+                    cmd: Some(crate::testing::ECHO_CMD.into()),
                     password: None,
                     protect: false,
                 })
@@ -999,7 +999,7 @@ mod tests {
             .write_all(
                 &(ClientToDaemon::AttachCreate {
                     session_id: "work-session".into(),
-                    cmd: Some("sleep 30".into()),
+                    cmd: Some(crate::testing::IDLE_CMD.into()),
                     password: None,
                     protect: false,
                 })
@@ -1041,7 +1041,7 @@ mod tests {
             .write_all(
                 &(ClientToDaemon::AttachCreate {
                     session_id: "work-session".into(),
-                    cmd: Some("echo RERUN".into()),
+                    cmd: Some(crate::testing::RERUN_CMD.into()),
                     password: None,
                     protect: false,
                 })
@@ -1117,7 +1117,7 @@ mod tests {
             .write_all(
                 &(ClientToDaemon::AttachCreate {
                     session_id: "cwd-test".into(),
-                    cmd: Some("sleep 30".into()),
+                    cmd: Some(crate::testing::IDLE_CMD.into()),
                     password: None,
                     protect: false,
                 })
@@ -1145,9 +1145,16 @@ mod tests {
             )
             .await
             .unwrap();
-        line.clear();
-        r.read_line(&mut line).await.unwrap();
-        match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
+        // Skip the child's output (ConPTY prints mode sequences on Windows).
+        let reply = loop {
+            line.clear();
+            r.read_line(&mut line).await.unwrap();
+            match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
+                DaemonToClient::Output { .. } => continue,
+                other => break other,
+            }
+        };
+        match reply {
             DaemonToClient::Cwd { session_id, cwd } => {
                 assert_eq!(session_id, "cwd-test");
                 assert!(!cwd.is_empty(), "cwd should not be empty");
@@ -1195,7 +1202,7 @@ mod tests {
         let mut owner = open(&sock).await;
         let create = |password: Option<&str>| ClientToDaemon::AttachCreate {
             session_id: "vault".into(),
-            cmd: Some("sleep 30".into()),
+            cmd: Some(crate::testing::IDLE_CMD.into()),
             password: password.map(str::to_string),
             protect: true,
         };
@@ -1258,7 +1265,7 @@ mod tests {
         let mut third = open(&sock).await;
         let plain = ClientToDaemon::AttachCreate {
             session_id: "plain".into(),
-            cmd: Some("sleep 30".into()),
+            cmd: Some(crate::testing::IDLE_CMD.into()),
             password: None,
             protect: false,
         };

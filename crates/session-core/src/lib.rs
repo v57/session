@@ -17,6 +17,8 @@ pub mod protocol;
 pub mod pty;
 pub mod registry;
 pub mod session;
+#[cfg(test)]
+mod testing;
 pub mod winsize;
 
 /// Crate version, surfaced to the CLI.
