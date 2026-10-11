@@ -383,10 +383,25 @@ async fn run_pump(
 
         if let Some(out) = out {
             match out {
-                Some(data) => {
+                Some(mut data) => {
+                    let queries = if cfg!(windows) {
+                        take_cursor_queries(&mut data)
+                    } else {
+                        0
+                    };
                     // Feed the emulator, then broadcast the raw bytes to all clients.
-                    emulator.lock().unwrap().ingest(&data);
-                    let _ = bcast.send(SessionEvent::Output(data));
+                    let replies = {
+                        let mut emu = emulator.lock().unwrap();
+                        emu.ingest(&data);
+                        let (row, col) = emu.cursor_pos();
+                        format!("\x1b[{};{}R", row + 1, col + 1).repeat(queries)
+                    };
+                    if !replies.is_empty() {
+                        let _ = pty.write(replies.as_bytes());
+                    }
+                    if !data.is_empty() {
+                        let _ = bcast.send(SessionEvent::Output(data));
+                    }
                 }
                 None => {
                     // Child closed its output side: it is exiting. Reap below.
@@ -424,19 +439,46 @@ async fn run_pump(
     let _ = bcast.send(SessionEvent::Exit(status));
 }
 
+/// The cursor position query, `ESC [ 6 n`.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Remove every cursor position query from `data` and return how many there
+/// were.
+///
+/// On Windows the daemon answers them itself: ConPTY opens every session by
+/// asking for the cursor position and holds back the shell's output until it
+/// gets an answer. Left to the clients, nobody answers while no client is
+/// attached, and every attached client answers, so the shell would receive
+/// stray replies as input.
+fn take_cursor_queries(data: &mut Vec<u8>) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i + CURSOR_QUERY.len() <= data.len() {
+        if &data[i..i + CURSOR_QUERY.len()] == CURSOR_QUERY {
+            data.drain(i..i + CURSOR_QUERY.len());
+            count += 1;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn shell_argv(snippet: &str) -> Vec<OsString> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        vec![
-            OsString::from(shell),
-            OsString::from("-c"),
-            OsString::from(snippet),
-        ]
+    #[test]
+    fn cursor_queries_are_taken_out() {
+        let mut data = b"\x1b[6n\x1b[?25lhi\x1b[6n!".to_vec();
+        assert_eq!(take_cursor_queries(&mut data), 2);
+        assert_eq!(data, b"\x1b[?25lhi!");
+        let mut plain = b"\x1b[6".to_vec();
+        assert_eq!(take_cursor_queries(&mut plain), 0);
+        assert_eq!(plain, b"\x1b[6");
     }
+
 
     // GATE: a real shell child; attach two in-memory clients; assert BOTH see
     // output and that input from client B reaches the pty (verified by the
