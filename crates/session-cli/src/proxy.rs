@@ -529,7 +529,7 @@ fn spawn_resize_watcher(tx: mpsc::UnboundedSender<Size>) -> tokio::task::JoinHan
             }
             Err(_) => {
                 // Registration failed; keep the channel open (no resize events).
-                let _ = tx;
+                let _tx = tx;
                 std::future::pending::<()>().await;
             }
         }
@@ -564,11 +564,11 @@ fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHa
                     let _ = tx.send(());
                 }
                 // Keep the channel open so the proxy keeps serving until exit.
-                let _ = tx;
+                let _tx = tx;
                 std::future::pending::<()>().await;
             }
             Err(_) => {
-                let _ = tx;
+                let _tx = tx;
                 std::future::pending::<()>().await;
             }
         }
@@ -576,10 +576,15 @@ fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHa
 }
 
 /// No SIGTERM to watch on non-Unix; keep the channel open (never fires).
+///
+/// `_tx` must be a binding: `let _ = tx` would not even capture `tx` in the
+/// `async move` block (Rust 2021 captures only what is used), so the sender
+/// would drop at once and the proxy would read the closed channel as SIGTERM
+/// and detach right after attaching.
 #[cfg(not(unix))]
 fn spawn_terminate_watcher(tx: mpsc::UnboundedSender<()>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let _ = tx;
+        let _tx = tx;
         std::future::pending::<()>().await;
     })
 }
