@@ -24,6 +24,7 @@
 //!                                (see [`password`]). Any command on a protected
 //!                                session asks for its password.
 //! * `session --daemon`        -> run the daemon loop (via session-core).
+//! * `session --version`       -> print the version.
 //!
 //! The management subcommands (list/kill/kill-all/detach) route to the
 //! connect/client layer ([`client`], [`daemon_launcher`]); the attach subcommands
@@ -74,6 +75,8 @@ enum Command {
     },
     /// Help request (-h / --help / help).
     Help,
+    /// `session --version`
+    Version,
     /// No recognizable command (usage).
     Usage,
 }
@@ -99,6 +102,10 @@ fn main() -> ExitCode {
     match parse_command(&rest) {
         Command::Help => {
             print_usage(&prog);
+            ExitCode::SUCCESS
+        }
+        Command::Version => {
+            println!("session {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Command::Usage => {
@@ -144,6 +151,7 @@ fn parse_command(rest: &[String]) -> Command {
     match cmd.as_str() {
         "--daemon" => Command::Daemon,
         "-h" | "--help" | "help" => Command::Help,
+        "-V" | "--version" => Command::Version,
         "list" => Command::List,
         "kill" => match rest.get(1) {
             Some(id) => Command::Kill { id: id.clone() },
@@ -215,6 +223,7 @@ fn print_usage(prog: &str) {
     eprintln!("  <name> [cmd...]            attach-or-create; cmd runs if the name is new");
     eprintln!("  -p <name> [cmd...]         the same, but a new session gets a password");
     eprintln!("  --daemon                   run the session daemon loop");
+    eprintln!("  --version                  print the version");
     eprintln!("password-protected sessions ask for their password; set {} to skip the prompt", password::ENV);
 }
 
@@ -492,6 +501,12 @@ mod tests {
     fn unknown_leading_flag_is_usage_not_a_session_id() {
         assert_eq!(parse_command(&[s("--foo")]), Command::Usage);
         assert_eq!(parse_command(&[s("-x")]), Command::Usage);
+    }
+
+    #[test]
+    fn version_flags() {
+        assert_eq!(parse_command(&[s("--version")]), Command::Version);
+        assert_eq!(parse_command(&[s("-V")]), Command::Version);
     }
 
     #[test]
