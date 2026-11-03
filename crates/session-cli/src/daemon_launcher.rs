@@ -248,10 +248,25 @@ async fn ensure_daemon_with_timeout<S: DaemonSpawner>(
 ) -> Result<Client> {
     // Fast path: is a daemon already up? (also handles a stale socket that a
     // new listener has already re-taken — connect wins either way).
+    if let Some(client) = connect_running(config).await? {
+        return Ok(client);
+    }
+
+    // Start a detached daemon, then wait for it to become reachable.
+    spawner
+        .spawn(config)
+        .context("failed to start the session daemon")?;
+    wait_for_daemon(config, timeout).await
+}
+
+/// The running daemon's client, None when no daemon is up. Commands that act on
+/// existing sessions use this directly: with no daemon there are none, and
+/// starting one would undo a daemon that was just stopped.
+pub async fn connect_running(config: &Config) -> Result<Option<Client>> {
     match client::Client::connect(config).await {
-        Ok(client) => return Ok(client),
-        // Socket absent / stale corpse / refused: a daemon is NOT up -> start one.
-        Err(ConnectError::Io(_)) => {}
+        Ok(client) => Ok(Some(client)),
+        // Socket absent / stale corpse / refused: a daemon is NOT up.
+        Err(ConnectError::Io(_)) => Ok(None),
         Err(ConnectError::Version(e)) => {
             // A daemon from another session release is running. Starting a
             // second one would orphan its sessions; tell the user instead.
@@ -270,12 +285,6 @@ async fn ensure_daemon_with_timeout<S: DaemonSpawner>(
             );
         }
     }
-
-    // Start a detached daemon, then wait for it to become reachable.
-    spawner
-        .spawn(config)
-        .context("failed to start the session daemon")?;
-    wait_for_daemon(config, timeout).await
 }
 
 /// Poll the socket with exponential backoff until a daemon answers `Hello` or
@@ -357,6 +366,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("in-process daemon never became reachable");
+    }
+
+    // With no daemon, `connect_running` reports none and starts nothing.
+    #[tokio::test]
+    async fn connect_running_does_not_start_a_daemon() {
+        let dir = tempdir().unwrap();
+        let cfg = temp_config(&dir);
+        assert!(connect_running(&cfg).await.unwrap().is_none());
+        assert!(!cfg.socket_path.exists(), "nothing may start listening");
     }
 
     // GATE: when the socket is absent, ensure_daemon must spawn exactly one

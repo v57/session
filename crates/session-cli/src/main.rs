@@ -32,7 +32,7 @@
 //! `1` operational error, `2` usage error.
 
 use client::Client;
-use daemon_launcher::ensure_daemon_running;
+use daemon_launcher::{connect_running, ensure_daemon_running};
 use session_core::config::Config;
 use session_core::protocol::{ClientToDaemon, DaemonToClient};
 use std::process::ExitCode;
@@ -248,16 +248,22 @@ async fn request(
     }
 }
 
-/// Connect to (or auto-start) the daemon and return a handshaked client.
+/// Connect to the running daemon for a management command. Only attaching starts
+/// one: these act on existing sessions, and with no daemon there are none.
 async fn connect_client() -> anyhow::Result<Client> {
-    let cfg = Config::load();
-    ensure_daemon_running(&cfg).await
+    connect_running(&Config::load())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no session daemon is running"))
 }
 
 /// `session list` — JSON listing of live sessions.
 async fn cmd_list() -> ExitCode {
-    let mut client = match connect_client().await {
-        Ok(c) => c,
+    let mut client = match connect_running(&Config::load()).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            println!("[]");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("session: {e}");
             return ExitCode::from(EXIT_ERROR);
@@ -335,8 +341,9 @@ fn report_failure(reply: anyhow::Result<Option<DaemonToClient>>) -> ExitCode {
 /// `session kill-all` — kill every session. The protocol acks via a purely
 /// informational `Error{"killed all sessions"}` frame, so that is success.
 async fn cmd_kill_all() -> ExitCode {
-    let mut client = match connect_client().await {
-        Ok(c) => c,
+    let mut client = match connect_running(&Config::load()).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("session: {e}");
             return ExitCode::from(EXIT_ERROR);
