@@ -12,7 +12,7 @@
 //! * `session list`            -> JSON listing of live sessions.
 //! * `session kill <uuid>`     -> kill one session (by id).
 //! * `session kill-all`        -> kill every session.
-//! * `session rename <from> <to>` -> rename a live session (must be detached).
+//! * `session rename <from> <to>` -> rename a live session.
 //! * `session detach`          -> send a detach on the management channel.
 //! * `session -d <name>`       -> print the session's current working directory.
 //! * `session attach <uuid>`   -> attach to an existing session.
@@ -216,7 +216,7 @@ fn print_usage(prog: &str) {
     eprintln!("  list                       list live sessions as JSON");
     eprintln!("  kill <uuid>                kill a session by id");
     eprintln!("  kill-all                   kill every session");
-    eprintln!("  rename <from> <to>         rename a live session (must be detached)");
+    eprintln!("  rename <from> <to>         rename a live session");
     eprintln!("  detach                     detach the current client (if any)");
     eprintln!("  -d <name>                  print the session's working directory");
     eprintln!("  attach <uuid>              attach to an existing session");
@@ -388,9 +388,9 @@ async fn cmd_cwd(name: String) -> ExitCode {
     }
 }
 
-/// `session rename <from> <to>` — rename a live session. The daemon refuses
-/// when the source is unknown, the target name is taken, or the session has
-/// attached clients; its error text is printed and exit is 1.
+/// `session rename <from> <to>` — rename a live session, attached or not. The
+/// daemon refuses when the source is unknown or the target name is taken; its
+/// error text is printed and exit is 1.
 async fn cmd_rename(from: String, to: String) -> ExitCode {
     let mut client = match connect_client().await {
         Ok(c) => c,

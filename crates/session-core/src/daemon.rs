@@ -314,8 +314,10 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
     )
     .await?;
 
-    // Which session this client is currently attached to (if any).
-    let mut attached: Option<String> = None;
+    // Whether this client is attached to a session. The registry knows which
+    // (`attached_to`): another client can rename it at any moment, so a name
+    // kept here would go stale.
+    let mut attached = false;
     let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
 
     // ---- Main frame loop.
@@ -382,11 +384,9 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::Rename { from, to, password } => {
-                // Rename refuses attached sessions and taken names; the
-                // registry moves the key AND the session's stored id. Only a
-                // headless client issues rename (attach proxies never do), but
-                // keep this connection's own binding honest in case it ever
-                // renames the session it is attached to (daemon-side no-op).
+                // Rename refuses taken names; the registry moves the key AND
+                // the session's stored id. Attached clients don't notice: they
+                // find their session by client id.
                 let _turn = password_turn(&registry, &from, password.as_deref()).await;
                 let rename_result = {
                     let mut reg = registry.lock().unwrap();
@@ -395,9 +395,6 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 };
                 match rename_result {
                     Ok(()) => {
-                        if attached.as_deref() == Some(from.as_str()) {
-                            attached = Some(to.clone());
-                        }
                         send_frame(&writer_tx, DaemonToClient::Renamed { session_id: to })
                             .await?;
                     }
@@ -405,10 +402,10 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 }
             }
 
-                rows,
             ClientToDaemon::Attach {
                 session_id,
                 password,
+                rows,
             } => {
                 let _turn = password_turn(&registry, &session_id, password.as_deref()).await;
                 // Reap finished sessions, then check the password and attach
@@ -425,7 +422,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         if let Some(h) = forwarder.take() {
                             h.abort();
                         }
-                        attached = Some(session_id.clone());
+                        attached = true;
                         let fw_id = session_id.clone();
                         send_frame(
                             &writer_tx,
@@ -438,6 +435,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         // Stream incremental output from this session to the client.
                         forwarder = Some(spawn_output_forwarder(
                             writer_tx.clone(),
+                            Arc::clone(&registry),
+                            client_id.clone(),
                             fw_id,
                             handle.receiver,
                         ));
@@ -450,8 +449,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 session_id,
                 cmd,
                 password,
-                rows,
                 protect,
+                rows,
             } => {
                 // Create-or-attach: if a session with this name is already live,
                 // attach to it and IGNORE the command (resume). Otherwise create
@@ -495,7 +494,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         if let Some(h) = forwarder.take() {
                             h.abort();
                         }
-                        attached = Some(session_id.clone());
+                        attached = true;
                         let fw_id = session_id.clone();
                         send_frame(
                             &writer_tx,
@@ -507,6 +506,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                         .await?;
                         forwarder = Some(spawn_output_forwarder(
                             writer_tx.clone(),
+                            Arc::clone(&registry),
+                            client_id.clone(),
                             fw_id,
                             handle.receiver,
                         ));
@@ -516,7 +517,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::Input { bytes } => {
-                let Some(ref sid) = attached else {
+                if !attached {
                     let _ = send_frame(
                         &writer_tx,
                         DaemonToClient::Error {
@@ -525,11 +526,11 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                     )
                     .await;
                     continue;
-                };
+                }
                 let result = registry
                     .lock()
                     .unwrap()
-                    .find(sid)
+                    .attached_to(&client_id)
                     .map(|s| s.write(&bytes, &client_id));
                 if let Some(Err(e)) = result {
                     let _ = send_frame(&writer_tx, DaemonToClient::Error { message: e.to_string() }).await;
@@ -537,7 +538,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
             }
 
             ClientToDaemon::Resize { rows, cols } => {
-                let Some(ref sid) = attached else {
+                if !attached {
                     let _ = send_frame(
                         &writer_tx,
                         DaemonToClient::Error {
@@ -546,11 +547,11 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                     )
                     .await;
                     continue;
-                };
+                }
                 let result = registry
                     .lock()
                     .unwrap()
-                    .find_mut(sid)
+                    .attached_to_mut(&client_id)
                     .map(|s| s.set_size(rows, cols, &client_id));
                 if let Some(Err(e)) = result {
                     let _ = send_frame(&writer_tx, DaemonToClient::Error { message: e.to_string() }).await;
@@ -561,10 +562,9 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 if let Some(h) = forwarder.take() {
                     h.abort();
                 }
-                if let Some(sid) = attached.take() {
-                    if let Some(s) = registry.lock().unwrap().find_mut(&sid) {
-                        s.detach(&client_id);
-                    }
+                attached = false;
+                if let Some(s) = registry.lock().unwrap().attached_to_mut(&client_id) {
+                    s.detach(&client_id);
                 }
             }
 
@@ -576,13 +576,17 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 // Bind to a `let` so the lock guard is dropped before the awaits.
                 let kill_result = {
                     let mut reg = registry.lock().unwrap();
+                    let own = reg
+                        .attached_to(&client_id)
+                        .is_some_and(|s| s.id() == session_id);
                     reg.authorize(&session_id, password.as_deref())
                         .and_then(|()| reg.kill(&session_id))
+                        .map(|()| own)
                 };
                 match kill_result {
-                    Ok(()) => {
-                        if attached.as_deref() == Some(session_id.as_str()) {
-                            attached = None;
+                    Ok(own) => {
+                        if own {
+                            attached = false;
                             if let Some(h) = forwarder.take() {
                                 h.abort();
                             }
@@ -599,8 +603,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 let kept = {
                     let mut reg = registry.lock().unwrap();
                     let kept = reg.kill_all();
-                    if attached.as_deref().is_some_and(|sid| !reg.contains(sid)) {
-                        attached = None;
+                    if attached && reg.attached_to(&client_id).is_none() {
+                        attached = false;
                         if let Some(h) = forwarder.take() {
                             h.abort();
                         }
@@ -620,10 +624,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
 
     // Client disconnected: detach from the session (so the primary-client
     // winsize authority is promoted cleanly) and tear down our tasks.
-    if let Some(sid) = attached {
-        if let Some(s) = registry.lock().unwrap().find_mut(&sid) {
-            s.detach(&client_id);
-        }
+    if let Some(s) = registry.lock().unwrap().attached_to_mut(&client_id) {
+        s.detach(&client_id);
     }
     if let Some(h) = forwarder.take() {
         h.abort();
@@ -637,6 +639,8 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
 /// frame so the client can close its view instead of lingering in raw mode.
 fn spawn_output_forwarder(
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    registry: Arc<Mutex<Registry>>,
+    client_id: ClientId,
     session_id: String,
     mut receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
 ) -> tokio::task::JoinHandle<()> {
@@ -653,11 +657,13 @@ fn spawn_output_forwarder(
                 // The session's child exited: tell the client so its proxy closes
                 // instead of staying attached to a dead shell.
                 Ok(SessionEvent::Exit(_)) => {
-                    if let Ok(frame) = (DaemonToClient::Exit {
-                        session_id: session_id.clone(),
-                    })
-                    .to_frame()
-                    {
+                    // The session may have been renamed since this client attached.
+                    let session_id = registry
+                        .lock()
+                        .unwrap()
+                        .attached_to(&client_id)
+                        .map_or(session_id, |s| s.id().to_string());
+                    if let Ok(frame) = (DaemonToClient::Exit { session_id }).to_frame() {
                         let _ = writer_tx.send(frame);
                     }
                     break;
@@ -911,13 +917,13 @@ mod tests {
                     cmd: Some(crate::testing::ECHO_CMD.into()),
                     password: None,
                     protect: false,
+                    rows: None,
                 })
                 .to_frame()
                 .unwrap(),
             )
             .await
             .unwrap();
-                    rows: None,
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let DaemonToClient::Attached { session_id: got_sid, redraw_bytes } =
@@ -1005,13 +1011,13 @@ mod tests {
                     cmd: Some(crate::testing::IDLE_CMD.into()),
                     password: None,
                     protect: false,
+                    rows: None,
                 })
                 .to_frame()
                 .unwrap(),
             )
             .await
             .unwrap();
-                    rows: None,
         let mut line = String::new();
         r1.read_line(&mut line).await.unwrap();
         let got1 = match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
@@ -1048,13 +1054,13 @@ mod tests {
                     cmd: Some(crate::testing::RERUN_CMD.into()),
                     password: None,
                     protect: false,
+                    rows: None,
                 })
                 .to_frame()
                 .unwrap(),
             )
             .await
             .unwrap();
-                    rows: None,
         let mut line = String::new();
         r2.read_line(&mut line).await.unwrap();
         let got2 = match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
@@ -1125,13 +1131,13 @@ mod tests {
                     cmd: Some(crate::testing::IDLE_CMD.into()),
                     password: None,
                     protect: false,
+                    rows: None,
                 })
                 .to_frame()
                 .unwrap(),
             )
             .await
             .unwrap();
-                    rows: None,
         line.clear();
         r.read_line(&mut line).await.unwrap();
         assert!(matches!(
@@ -1175,6 +1181,97 @@ mod tests {
         daemon.abort();
     }
 
+    // Renaming a session under an attached client (from another connection)
+    // keeps that client working: input still reaches the session, and leaving
+    // detaches it from the session's new name.
+    #[tokio::test]
+    async fn rename_keeps_attached_client_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_in(dir.path());
+        let daemon = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        async fn open(path: &Path) -> BufReader<TokioStream> {
+            let mut r = BufReader::new(connect_with_retry(path).await);
+            ask(&mut r, ClientToDaemon::Hello { version: PROTOCOL_VERSION }).await;
+            r
+        }
+        async fn ask(r: &mut BufReader<TokioStream>, frame: ClientToDaemon) -> DaemonToClient {
+            r.get_mut().write_all(&frame.to_frame().unwrap()).await.unwrap();
+            let mut line = String::new();
+            r.read_line(&mut line).await.unwrap();
+            DaemonToClient::from_frame(line.as_bytes()).unwrap()
+        }
+        async fn attached_count(r: &mut BufReader<TokioStream>, name: &str) -> Option<usize> {
+            match ask(r, ClientToDaemon::List).await {
+                DaemonToClient::Listing { sessions } => {
+                    sessions.iter().find(|s| s.id == name).map(|s| s.attached)
+                }
+                other => panic!("expected Listing, got {other:?}"),
+            }
+        }
+        let sock = dir.path().join("session.sock");
+
+        let mut owner = open(&sock).await;
+        let create = ClientToDaemon::AttachCreate {
+            session_id: "before".into(),
+            cmd: Some(crate::testing::ECHO_CMD.into()),
+            password: None,
+            protect: false,
+            rows: None,
+        };
+        assert!(matches!(ask(&mut owner, create).await, DaemonToClient::Attached { .. }));
+
+        let mut other = open(&sock).await;
+        let rename = ClientToDaemon::Rename {
+            from: "before".into(),
+            to: "after".into(),
+            password: None,
+        };
+        assert_eq!(
+            ask(&mut other, rename).await,
+            DaemonToClient::Renamed { session_id: "after".into() }
+        );
+        assert_eq!(attached_count(&mut other, "after").await, Some(1));
+        assert_eq!(attached_count(&mut other, "before").await, None);
+
+        // The attached client's input still reaches the session.
+        let input = ClientToDaemon::Input { bytes: b"still-here\r".to_vec() };
+        owner.get_mut().write_all(&input.to_frame().unwrap()).await.unwrap();
+        let mut seen = Vec::new();
+        let reached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut line = String::new();
+                owner.read_line(&mut line).await.unwrap();
+                match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
+                    DaemonToClient::Output { bytes } => {
+                        seen.extend_from_slice(&bytes);
+                        if String::from_utf8_lossy(&seen).contains("still-here") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected Output, got {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(reached.is_ok(), "input after rename was lost: {:?}", String::from_utf8_lossy(&seen));
+
+        // Leaving detaches from the renamed session.
+        owner.get_mut().write_all(&ClientToDaemon::Detach.to_frame().unwrap()).await.unwrap();
+        owner.get_mut().flush().await.unwrap();
+        let detached = tokio::time::timeout(Duration::from_secs(5), async {
+            while attached_count(&mut other, "after").await != Some(0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(detached.is_ok(), "detach must find the renamed session");
+
+        daemon.abort();
+    }
+
     // A protected session: created with `protect`, it is listed as protected,
     // refuses attach/cwd/kill without its password (PasswordRequired, with
     // `wrong` set after a bad guess, which is answered only after the delay),
@@ -1211,6 +1308,7 @@ mod tests {
             cmd: Some(crate::testing::IDLE_CMD.into()),
             password: password.map(str::to_string),
             protect: true,
+            rows: None,
         };
         assert!(matches!(ask(&mut owner, create(None)).await, DaemonToClient::Error { .. }));
         assert!(matches!(
@@ -1229,6 +1327,7 @@ mod tests {
         let attach = |password: Option<&str>| ClientToDaemon::Attach {
             session_id: "vault".into(),
             password: password.map(str::to_string),
+            rows: None,
         };
         assert_eq!(ask(&mut other, attach(None)).await, required(false));
         let started = std::time::Instant::now();
@@ -1240,6 +1339,7 @@ mod tests {
             cmd: None,
             password: None,
             protect: false,
+            rows: None,
         };
         assert_eq!(ask(&mut other, resume).await, required(false));
         let cwd = ClientToDaemon::Cwd {
@@ -1274,6 +1374,7 @@ mod tests {
             cmd: Some(crate::testing::IDLE_CMD.into()),
             password: None,
             protect: false,
+            rows: None,
         };
         assert!(matches!(ask(&mut third, plain).await, DaemonToClient::Attached { .. }));
         let mut fourth = open(&sock).await;
@@ -1282,6 +1383,7 @@ mod tests {
             cmd: None,
             password: Some("pw".into()),
             protect: true,
+            rows: None,
         };
         match ask(&mut fourth, reprotect).await {
             DaemonToClient::Error { message } => assert!(message.contains("without a password")),
@@ -1296,8 +1398,3 @@ mod tests {
         daemon.abort();
     }
 }
-            rows: None,
-            rows: None,
-            rows: None,
-            rows: None,
-            rows: None,

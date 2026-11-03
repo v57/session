@@ -169,8 +169,8 @@ impl Session {
     }
 
     /// Change the session's id (used by rename; the registry key moves too).
-    /// Safe only while no client is attached — attached connections bind to
-    /// the name they attached with, so `Registry::rename` refuses that case.
+    /// Attached connections are unaffected: they find their session by client
+    /// id ([`crate::registry::Registry::attached_to`]), never by name.
     pub fn set_id(&mut self, id: impl Into<String>) {
         self.id = id.into();
     }
@@ -204,6 +204,11 @@ impl Session {
     /// Number of currently-attached clients.
     pub fn attached(&self) -> usize {
         self.clients.lock().unwrap().len()
+    }
+
+    /// Whether `client_id` is attached to this session.
+    pub fn has_client(&self, client_id: &ClientId) -> bool {
+        self.clients.lock().unwrap().iter().any(|c| c.id == *client_id)
     }
 
     /// The primary client (oldest attached), if any.
@@ -242,11 +247,6 @@ impl Session {
     /// the primary. The replay is a serialised screen + scrollback sized to the
     /// emulator; the receiver streams all subsequent incremental output.
     pub fn attach(&mut self, client_id: ClientId) -> anyhow::Result<AttachHandle> {
-        if self.exited.load(Ordering::SeqCst) {
-            anyhow::bail!("session has exited; cannot attach");
-        }
-        let redraw = self.emulator.lock().unwrap().render_snapshot();
-        let mut receiver = self.broadcast.subscribe();
         self.attach_with_rows(client_id, None)
     }
 
@@ -256,6 +256,15 @@ impl Session {
         client_id: ClientId,
         rows: Option<u16>,
     ) -> anyhow::Result<AttachHandle> {
+        if self.exited.load(Ordering::SeqCst) {
+            anyhow::bail!("session has exited; cannot attach");
+        }
+        let redraw = self
+            .emulator
+            .lock()
+            .unwrap()
+            .render_snapshot_for(rows.map(usize::from));
+        let mut receiver = self.broadcast.subscribe();
         // Discard any events buffered before attach (the replay snapshot covers
         // them); the receiver is now positioned at the live edge.
         while receiver.try_recv().is_ok() {}

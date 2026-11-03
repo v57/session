@@ -82,8 +82,29 @@ impl Registry {
         self.sessions.get_mut(id)
     }
 
-    /// Attach a client to a session, returning its replay + live stream.
+    /// The session `client_id` is attached to, whatever it is called by now.
+    pub fn attached_to(&self, client_id: &ClientId) -> Option<&Session> {
+        self.sessions.values().find(|s| s.has_client(client_id))
+    }
+
+    /// Mutable [`Self::attached_to`].
+    pub fn attached_to_mut(&mut self, client_id: &ClientId) -> Option<&mut Session> {
+        self.sessions.values_mut().find(|s| s.has_client(client_id))
+    }
+
+    /// Attach a client to a session, returning its replay + live stream. A
+    /// client watches one session at a time, so it leaves any other one.
     pub fn attach(&mut self, id: &str, client_id: ClientId) -> anyhow::Result<AttachHandle> {
+        self.attach_with_rows(id, client_id, None)
+    }
+
+    /// [`Self::attach`] with a replay fitted to a client `rows` tall.
+    pub fn attach_with_rows(
+        &mut self,
+        id: &str,
+        client_id: ClientId,
+        rows: Option<u16>,
+    ) -> anyhow::Result<AttachHandle> {
         let session = self
             .sessions
             .get_mut(id)
@@ -101,16 +122,6 @@ impl Registry {
     pub fn kill(&mut self, id: &str) -> anyhow::Result<()> {
         {
             let session = self
-        self.attach_with_rows(id, client_id, None)
-    }
-
-    /// [`Self::attach`] with a replay fitted to a client `rows` tall.
-    pub fn attach_with_rows(
-        &mut self,
-        id: &str,
-        client_id: ClientId,
-        rows: Option<u16>,
-    ) -> anyhow::Result<AttachHandle> {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
@@ -125,11 +136,9 @@ impl Registry {
     /// Rename a live session (`from` -> `to`), moving the registry key and
     /// updating the session's stored id so `list`/attach report the new name.
     ///
-    /// Refused when `from` is unknown, `to` is already live, or the session
-    /// has attached clients (every attached connection binds to the name it
-    /// attached with — renaming under an attached client would strand that
-    /// client's input routing, so it must detach first). Renaming a session
-    /// to itself is a no-op.
+    /// Refused when `from` is unknown or `to` is already live. Attached
+    /// clients stay attached: their connections find the session by client id.
+    /// Renaming a session to itself is a no-op.
     pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
         if from == to {
             return Ok(());
@@ -139,11 +148,6 @@ impl Registry {
         }
         if self.sessions.contains_key(to) {
             return Err(anyhow::anyhow!("a session named '{to}' already exists"));
-        }
-        if self.sessions.get(from).is_some_and(|s| s.attached() > 0) {
-            return Err(anyhow::anyhow!(
-                "session '{from}' has attached clients; detach before renaming"
-            ));
         }
         let mut session = self
             .sessions
@@ -384,10 +388,10 @@ mod tests {
         reg.kill("new-name").expect("kill renamed session");
     }
 
-    // Rename refuses an unknown source, a taken target, and an ATTACHED
-    // session (its client connections bind to the old name).
+    // Rename refuses an unknown source and a taken target. An ATTACHED session
+    // renames, and its client still finds it under the new name.
     #[tokio::test]
-    async fn rename_rejects_unknown_taken_and_attached() {
+    async fn rename_rejects_unknown_and_taken_but_keeps_attached_clients() {
         let mut reg = Registry::new(2000);
         assert!(reg.rename("nope", "x").is_err(), "unknown source");
 
@@ -395,16 +399,16 @@ mod tests {
         reg.create_session("b", None).expect("create b");
         assert!(reg.rename("a", "b").is_err(), "taken target");
 
-        // An attached client must detach through the session (dropping the
-        // AttachHandle only drops its broadcast receiver).
         let client: crate::session::ClientId = "client-1".into();
         let _handle = reg.attach("b", client.clone()).expect("attach b");
-        assert!(reg.rename("b", "c").is_err(), "attached session refuses rename");
-        reg.find_mut("b")
-            .expect("session b")
-            .detach(&client);
-        assert!(reg.rename("b", "c").is_ok(), "detached session renames");
+        assert!(reg.rename("b", "c").is_ok(), "attached session renames");
         assert!(reg.contains("c"));
+        assert_eq!(reg.attached_to(&client).expect("still attached").id(), "c");
+
+        // Attaching elsewhere leaves the previous session.
+        let _other = reg.attach("a", client.clone()).expect("attach a");
+        assert_eq!(reg.attached_to(&client).expect("moved").id(), "a");
+        assert_eq!(reg.find("c").expect("session c").attached(), 0);
 
         reg.kill("a").expect("kill a");
         reg.kill("c").expect("kill c");

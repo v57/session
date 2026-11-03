@@ -84,10 +84,8 @@ pub enum ClientToDaemon {
     /// sessions are left running (kill them one by one with their password).
     KillAll,
     /// Client renames a live session (`from` -> `to`). Refused by the daemon
-    /// when `from` is unknown, `to` is already live, or the session has
-    /// attached clients (each client connection binds to the name it attached
-    /// with; renaming under an attached client would strand its input
-    /// routing). Headless — needs no TTY.
+    /// when `from` is unknown or `to` is already live; attached clients stay
+    /// attached. Headless — needs no TTY.
     Rename {
         from: String,
         to: String,
@@ -374,28 +372,28 @@ mod tests {
             version: PROTOCOL_VERSION,
         });
         roundtrip_frame(&ClientToDaemon::Attach {
-            rows: None,
             session_id: "s1".into(),
             password: None,
+            rows: None,
         });
         roundtrip_frame(&ClientToDaemon::Attach {
-            rows: None,
             session_id: "s1".into(),
             password: Some("pw".into()),
+            rows: None,
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s2".into(),
             cmd: Some("bash".into()),
-            rows: None,
             password: None,
             protect: false,
+            rows: None,
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s3".into(),
             cmd: None,
-            rows: None,
             password: Some("pw".into()),
             protect: true,
+            rows: None,
         });
         roundtrip_frame(&ClientToDaemon::Input {
             bytes: vec![0x1b, b'[', b'2', b'J'],
@@ -475,9 +473,9 @@ mod tests {
             ClientToDaemon::AttachCreate {
                 session_id: "s".into(),
                 cmd: None,
-                rows: None,
                 password: None,
                 protect: false,
+                rows: None,
             }
         );
         let json = String::from_utf8(frame.to_frame().unwrap()).unwrap();
@@ -490,9 +488,9 @@ mod tests {
     fn roundtrip_ndjson_frames() {
         let frames = vec![
             ClientToDaemon::Attach {
-                rows: None,
                 session_id: "s1".into(),
                 password: None,
+                rows: None,
             },
             ClientToDaemon::Resize {
                 rows: 24,
