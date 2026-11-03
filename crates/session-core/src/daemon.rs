@@ -405,6 +405,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 }
             }
 
+                rows,
             ClientToDaemon::Attach {
                 session_id,
                 password,
@@ -416,7 +417,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                     let mut reg = registry.lock().unwrap();
                     reg.reap_exited();
                     reg.authorize(&session_id, password.as_deref())
-                        .and_then(|()| reg.attach(&session_id, client_id.clone()))
+                        .and_then(|()| reg.attach_with_rows(&session_id, client_id.clone(), rows))
                 };
                 match attach_result {
                     Ok(handle) => {
@@ -449,6 +450,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                 session_id,
                 cmd,
                 password,
+                rows,
                 protect,
             } => {
                 // Create-or-attach: if a session with this name is already live,
@@ -486,7 +488,7 @@ async fn handle_connection(stream: TokioStream, registry: Arc<Mutex<Registry>>) 
                                 None => Ok(()),
                             })
                     }
-                    .and_then(|()| reg.attach(&session_id, client_id.clone()))
+                    .and_then(|()| reg.attach_with_rows(&session_id, client_id.clone(), rows))
                 };
                 match attach_result {
                     Ok(handle) => {
@@ -915,6 +917,7 @@ mod tests {
             )
             .await
             .unwrap();
+                    rows: None,
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let DaemonToClient::Attached { session_id: got_sid, redraw_bytes } =
@@ -1008,6 +1011,7 @@ mod tests {
             )
             .await
             .unwrap();
+                    rows: None,
         let mut line = String::new();
         r1.read_line(&mut line).await.unwrap();
         let got1 = match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
@@ -1050,6 +1054,7 @@ mod tests {
             )
             .await
             .unwrap();
+                    rows: None,
         let mut line = String::new();
         r2.read_line(&mut line).await.unwrap();
         let got2 = match DaemonToClient::from_frame(line.as_bytes()).unwrap() {
@@ -1126,6 +1131,7 @@ mod tests {
             )
             .await
             .unwrap();
+                    rows: None,
         line.clear();
         r.read_line(&mut line).await.unwrap();
         assert!(matches!(
@@ -1290,3 +1296,8 @@ mod tests {
         daemon.abort();
     }
 }
+            rows: None,
+            rows: None,
+            rows: None,
+            rows: None,
+            rows: None,

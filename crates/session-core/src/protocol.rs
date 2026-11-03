@@ -39,6 +39,10 @@ pub enum ClientToDaemon {
         /// The session's password, when it is protected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
+        /// The client's terminal height, so the replay fits it (see
+        /// [`crate::emulator::Emulator::render_snapshot_for`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
     },
     /// Client creates a new session (optionally running `cmd`), then attaches.
     AttachCreate {
@@ -54,6 +58,9 @@ pub enum ClientToDaemon {
         /// Refused when the name is already live without a password.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         protect: bool,
+        /// The client's terminal height (see [`ClientToDaemon::Attach`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
     },
     /// Raw input bytes (keystrokes) to feed to the session's pty.
     Input {
@@ -367,22 +374,26 @@ mod tests {
             version: PROTOCOL_VERSION,
         });
         roundtrip_frame(&ClientToDaemon::Attach {
+            rows: None,
             session_id: "s1".into(),
             password: None,
         });
         roundtrip_frame(&ClientToDaemon::Attach {
+            rows: None,
             session_id: "s1".into(),
             password: Some("pw".into()),
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s2".into(),
             cmd: Some("bash".into()),
+            rows: None,
             password: None,
             protect: false,
         });
         roundtrip_frame(&ClientToDaemon::AttachCreate {
             session_id: "s3".into(),
             cmd: None,
+            rows: None,
             password: Some("pw".into()),
             protect: true,
         });
@@ -464,6 +475,7 @@ mod tests {
             ClientToDaemon::AttachCreate {
                 session_id: "s".into(),
                 cmd: None,
+                rows: None,
                 password: None,
                 protect: false,
             }
@@ -478,6 +490,7 @@ mod tests {
     fn roundtrip_ndjson_frames() {
         let frames = vec![
             ClientToDaemon::Attach {
+                rows: None,
                 session_id: "s1".into(),
                 password: None,
             },

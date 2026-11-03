@@ -88,13 +88,29 @@ impl Registry {
             .sessions
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        session.attach(client_id)
+        let handle = session.attach_with_rows(client_id.clone(), rows)?;
+        for (name, other) in self.sessions.iter_mut() {
+            if name != id {
+                other.detach(&client_id);
+            }
+        }
+        Ok(handle)
     }
 
     /// Kill a session (terminate its child) and remove it from the registry.
     pub fn kill(&mut self, id: &str) -> anyhow::Result<()> {
         {
             let session = self
+        self.attach_with_rows(id, client_id, None)
+    }
+
+    /// [`Self::attach`] with a replay fitted to a client `rows` tall.
+    pub fn attach_with_rows(
+        &mut self,
+        id: &str,
+        client_id: ClientId,
+        rows: Option<u16>,
+    ) -> anyhow::Result<AttachHandle> {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;

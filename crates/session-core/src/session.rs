@@ -247,6 +247,15 @@ impl Session {
         }
         let redraw = self.emulator.lock().unwrap().render_snapshot();
         let mut receiver = self.broadcast.subscribe();
+        self.attach_with_rows(client_id, None)
+    }
+
+    /// [`Self::attach`] with a replay fitted to a client `rows` tall.
+    pub fn attach_with_rows(
+        &mut self,
+        client_id: ClientId,
+        rows: Option<u16>,
+    ) -> anyhow::Result<AttachHandle> {
         // Discard any events buffered before attach (the replay snapshot covers
         // them); the receiver is now positioned at the live edge.
         while receiver.try_recv().is_ok() {}

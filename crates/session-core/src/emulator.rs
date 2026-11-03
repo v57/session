@@ -109,7 +109,14 @@ impl Emulator {
         if rows == 0 || cols == 0 {
             return;
         }
-        self.primary.reflow(cols, rows);
+        // The main screen keeps its cursor on its line. Unused rows must go first:
+        // reflow keeps the screen's LAST rows, so a shrink would keep them and
+        // scroll the prompt away, and the shell would redraw it on a blank row.
+        let below_cursor = (!self.in_alt).then(|| self.primary.trim_unused_rows(self.cursor.row));
+        let filled = self.primary.reflow(cols, rows);
+        if let Some(below) = below_cursor {
+            self.cursor.row = filled.saturating_sub(below + 1);
+        }
         self.alt.reflow(cols, rows);
         self.cols = cols;
         self.rows = rows;
@@ -155,6 +162,14 @@ impl Emulator {
     /// Serialise the current screen + scrollback (and truecolor/alt-screen state)
     /// as an escape-sequence stream that reproduces this buffer when replayed.
     pub fn render_snapshot(&self) -> Vec<u8> {
+        self.render_snapshot_for(None)
+    }
+
+    /// [`Self::render_snapshot`] for a client with `client_rows` rows, which may
+    /// differ from this screen's: the screen's top row lands on the client's top
+    /// row. Blank rows below the cursor and the last content are left out when
+    /// the client is shorter, so they don't scroll content into its scrollback.
+    pub fn render_snapshot_for(&self, client_rows: Option<usize>) -> Vec<u8> {
         let mut out = Vec::new();
         let grid = if self.in_alt {
             &self.alt
@@ -174,9 +189,25 @@ impl Emulator {
         // line except the last. Writing more rows than the viewport causes the
         // top rows to scroll into the consumer's scrollback, so the last `rows`
         // lines land on-screen and the remainder become its scrollback.
+        let screen_rows = grid.lines.len();
+        let client_rows = client_rows.filter(|r| *r > 0).unwrap_or(screen_rows);
+        let used = grid
+            .lines
+            .iter()
+            .rposition(|line| line.cells.iter().any(|c| *c != Cell::default()))
+            .map_or(0, |last| last + 1)
+            .max(self.cursor.row + 1);
+        // With scrollback the rows must fill the client, to push its top row up
+        // to where the screen starts. Without any, nothing has to move.
+        let shown = if grid.scrollback.is_empty() { used } else { used.max(client_rows) };
+        // How far the rows ended up above where the screen has them.
+        let scrolled_away = shown.saturating_sub(client_rows);
+
         let mut lines: Vec<&Row> = Vec::new();
         lines.extend(grid.scrollback.iter());
-        lines.extend(grid.lines.iter());
+        lines.extend(grid.lines.iter().take(shown));
+        let blank = Row { cells: Vec::new(), wrapped: false };
+        lines.extend(std::iter::repeat_n(&blank, shown.saturating_sub(screen_rows)));
         let total = lines.len();
         for (i, line) in lines.iter().enumerate() {
             self.render_line(line, &mut out);
@@ -187,7 +218,7 @@ impl Emulator {
         }
 
         // Restore the cursor to its live position (1-based).
-        let r = self.cursor.row + 1;
+        let r = self.cursor.row.saturating_sub(scrolled_away) + 1;
         let c = (self.cursor.col.min(self.cols.saturating_sub(1))) + 1;
         out.extend_from_slice(format!("\x1b[{};{}H", r, c).as_bytes());
         out
@@ -199,7 +230,10 @@ impl Emulator {
         out.push(b'\r');
         let mut last_attr: Option<Attr> = None;
         let mut col = 0usize;
-        while col < line.cells.len() {
+        // The row's trailing blanks stay out: the screen was just cleared, and a
+        // client narrower than this screen would wrap them into extra rows.
+        let end = line.cells.iter().rposition(|c| !c.is_blank()).map_or(0, |last| last + 1);
+        while col < end {
             let cell = &line.cells[col];
             if cell.continued {
                 col += 1;
@@ -1190,6 +1224,92 @@ mod tests {
             replay.ingest(&e.render_snapshot());
             assert_invariants(&replay, &format!("seed {seed} replay"));
         }
+    }
+
+    // A session's screen replayed into a shorter client (a Shell terminal starts
+    // at 24 rows, whatever the window had before) keeps its top row on top: no
+    // blank rows in the client's scrollback, the cursor on its line.
+    #[test]
+    fn replay_into_a_shorter_client_keeps_the_top_row() {
+        let mut e = Emulator::new(30, 80, 50);
+        e.ingest(b"prompt %");
+        let mut replay = Emulator::new(24, 80, 50);
+        replay.ingest(&e.render_snapshot_for(Some(24)));
+        assert_eq!(replay.scrollback_len(), 0);
+        assert_eq!(replay.cursor_pos(), (0, 8));
+        assert_eq!(replay.primary.lines[0].cells[0].ch, 'p');
+    }
+
+    // Content lower than the client is tall: the client shows its last rows
+    // and the rest becomes its scrollback, with the cursor still on its line.
+    #[test]
+    fn replay_keeps_the_cursor_on_its_line_when_content_overflows() {
+        let mut e = Emulator::new(30, 80, 50);
+        for i in 0..27 {
+            e.ingest(format!("line {i}\r\n").as_bytes());
+        }
+        e.ingest(b"prompt %");
+        let mut replay = Emulator::new(24, 80, 50);
+        replay.ingest(&e.render_snapshot_for(Some(24)));
+        assert_eq!(replay.scrollback_len(), 4);
+        assert_eq!(replay.cursor_pos(), (23, 8));
+        assert_eq!(replay.primary.lines[23].cells[0].ch, 'p');
+    }
+
+    // A client narrower than the screen: rows don't wrap on their padding.
+    #[test]
+    fn replay_into_a_narrower_client_keeps_rows_whole() {
+        let mut e = Emulator::new(24, 100, 50);
+        e.ingest(b"prompt %");
+        let mut replay = Emulator::new(18, 40, 50);
+        replay.ingest(&e.render_snapshot_for(Some(18)));
+        assert_eq!(replay.scrollback_len(), 0);
+        assert_eq!(replay.cursor_pos(), (0, 8));
+    }
+
+    // A client taller than the screen, with scrollback: the screen stays on top
+    // and the scrollback above it, not pulled down onto the client's screen.
+    #[test]
+    fn replay_into_a_taller_client_keeps_the_screen_on_top() {
+        let mut e = Emulator::new(5, 80, 50);
+        for i in 0..8 {
+            e.ingest(format!("line {i}\r\n").as_bytes());
+        }
+        e.ingest(b"prompt %");
+        let mut replay = Emulator::new(10, 80, 50);
+        replay.ingest(&e.render_snapshot_for(Some(10)));
+        assert_eq!(replay.scrollback_len(), 4);
+        assert_eq!(replay.cursor_pos(), (4, 8));
+        assert_eq!(replay.primary.lines[4].cells[0].ch, 'p');
+    }
+
+    #[test]
+    fn shrinking_keeps_the_prompt_and_drops_unused_rows() {
+        let mut e = Emulator::new(30, 80, 50);
+        e.ingest(b"prompt %");
+        e.resize(24, 80);
+        assert_eq!(e.scrollback_len(), 0);
+        assert_eq!(e.cursor_pos(), (0, 8));
+        assert_eq!(e.primary.lines[0].cells[0].ch, 'p');
+    }
+
+    #[test]
+    fn resizing_keeps_the_cursor_on_its_line() {
+        let mut e = Emulator::new(5, 80, 50);
+        for i in 0..8 {
+            e.ingest(format!("line {i}\r\n").as_bytes());
+        }
+        e.ingest(b"prompt %");
+        // Growing pulls the scrollback back onto the screen, cursor included.
+        e.resize(10, 80);
+        assert_eq!(e.scrollback_len(), 0);
+        assert_eq!(e.cursor_pos(), (8, 8));
+        assert_eq!(e.primary.lines[8].cells[0].ch, 'p');
+        // Shrinking scrolls real rows away, and the prompt stays at the bottom.
+        e.resize(4, 80);
+        assert_eq!(e.scrollback_len(), 5);
+        assert_eq!(e.cursor_pos(), (3, 8));
+        assert_eq!(e.primary.lines[3].cells[0].ch, 'p');
     }
 
     #[test]

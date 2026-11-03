@@ -259,9 +259,12 @@ impl Grid {
     /// re-broken at `new_cols` and re-distributed so the *last* `new_rows` lines
     /// are visible and the earlier ones become scrollback (the standard resize
     /// behaviour: the viewport stays anchored to the bottom of the history).
-    pub fn reflow(&mut self, new_cols: usize, new_rows: usize) {
+    ///
+    /// Returns how many rows of the new screen hold what the grid held: the
+    /// screen's last row, or less when padding blank rows follow.
+    pub fn reflow(&mut self, new_cols: usize, new_rows: usize) -> usize {
         if new_cols == 0 || new_rows == 0 {
-            return;
+            return 0;
         }
 
         // Collect every logical row (scrollback oldest->newest, then screen),
@@ -347,6 +350,7 @@ impl Grid {
         // The last `new_rows` logical rows are the visible screen; everything
         // before them is scrollback (capped).
         let total = new_rows_buf.len();
+        let filled = total.min(new_rows);
         if total <= new_rows {
             self.lines = new_rows_buf;
             self.scrollback.clear();
@@ -365,6 +369,20 @@ impl Grid {
 
         self.cols = new_cols;
         self.rows = new_rows;
+        filled
+    }
+
+    /// Drop the screen's rows below `cursor_row` and the last content: unused
+    /// screen, not history. Returns how many rows stay below the cursor.
+    pub fn trim_unused_rows(&mut self, cursor_row: usize) -> usize {
+        let used = self
+            .lines
+            .iter()
+            .rposition(|line| line.cells.iter().any(|c| !c.is_blank()))
+            .map_or(0, |last| last + 1)
+            .max(cursor_row + 1);
+        self.lines.truncate(used);
+        self.lines.len().saturating_sub(cursor_row + 1)
     }
 
     /// Grow each cached line with the reserve `cells` for a `blank` cell.

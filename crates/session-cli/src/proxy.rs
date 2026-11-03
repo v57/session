@@ -201,12 +201,27 @@ fn attach_frame(session: &str, cmd: Option<&str>, term: Option<&str>, create: bo
             cmd: cmd.map(|c| with_term_prefix(c, term)),
             password: None,
             protect: false,
+            rows: None,
         }
     } else {
         ClientToDaemon::Attach {
             session_id: session.to_string(),
             password: None,
+            rows: None,
         }
+    }
+}
+
+/// `frame` asking for a replay that fits a terminal `height` rows tall.
+fn with_rows(frame: ClientToDaemon, height: Option<u16>) -> ClientToDaemon {
+    match frame {
+        ClientToDaemon::AttachCreate { session_id, cmd, password, protect, .. } => {
+            ClientToDaemon::AttachCreate { session_id, cmd, password, protect, rows: height }
+        }
+        ClientToDaemon::Attach { session_id, password, .. } => {
+            ClientToDaemon::Attach { session_id, password, rows: height }
+        }
+        other => other,
     }
 }
 
@@ -214,15 +229,17 @@ fn attach_frame(session: &str, cmd: Option<&str>, term: Option<&str>, create: bo
 /// `protect` (create only).
 fn with_password(frame: &ClientToDaemon, password: Option<String>, protect: bool) -> ClientToDaemon {
     match frame.clone() {
-        ClientToDaemon::AttachCreate { session_id, cmd, .. } => ClientToDaemon::AttachCreate {
+        ClientToDaemon::AttachCreate { session_id, cmd, rows, .. } => ClientToDaemon::AttachCreate {
             session_id,
             cmd,
             password,
             protect,
+            rows,
         },
-        ClientToDaemon::Attach { session_id, .. } => ClientToDaemon::Attach {
+        ClientToDaemon::Attach { session_id, rows, .. } => ClientToDaemon::Attach {
             session_id,
             password,
+            rows,
         },
         other => other,
     }
@@ -313,7 +330,10 @@ pub fn attach(
 
         // The attach (or create-attach) frame; a custom command may carry the
         // TERM prefix so the daemon-spawned child sees a truecolor terminal.
-        let frame = attach_frame(session, cmd, opts.term.as_deref(), create);
+        let frame = with_rows(
+            attach_frame(session, cmd, opts.term.as_deref(), create),
+            terminal_size().ok().map(|(rows, _)| rows),
+        );
         let mut asker = crate::password::Asker::from_env();
         let protect = opts.protect && create;
         let redraw = open_session(&mut conn, session, &frame, protect, &mut asker).await?;
@@ -801,6 +821,7 @@ mod tests {
                 cmd: Some("env TERM=xterm-256color vim".to_string()),
                 password: None,
                 protect: false,
+                rows: None,
             }
         );
     }
@@ -815,6 +836,7 @@ mod tests {
                 cmd: Some("vim".to_string()),
                 password: None,
                 protect: false,
+                rows: None,
             }
         );
         // create=false (explicit `session attach`) is unaffected by TERM.
@@ -822,7 +844,7 @@ mod tests {
             attach_frame("s1", None, Some("xterm-256color"), false),
             ClientToDaemon::Attach {
                 session_id: "s1".to_string(),
-                password: None
+                password: None, rows: None
             }
         );
         // create=true with a bare name sends AttachCreate{None}, so `session
@@ -834,6 +856,7 @@ mod tests {
                 cmd: None,
                 password: None,
                 protect: false,
+                rows: None,
             }
         );
     }
@@ -1008,11 +1031,11 @@ mod tests {
             [
                 ClientToDaemon::Attach {
                     session_id: "s1".into(),
-                    password: None
+                    password: None, rows: None
                 },
                 ClientToDaemon::Attach {
                     session_id: "s1".into(),
-                    password: Some("pw".into())
+                    password: Some("pw".into()), rows: None
                 },
             ]
         );
