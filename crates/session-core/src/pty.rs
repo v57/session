@@ -252,7 +252,7 @@ impl Pty {
 
 /// Build the `CommandBuilder`: the login shell by default, else the custom argv.
 fn build_command(argv: Option<Vec<OsString>>) -> CommandBuilder {
-    match argv {
+    let mut cb = match argv {
         None => CommandBuilder::new_default_prog(),
         Some(mut argv) => {
             if argv.is_empty() {
@@ -264,7 +264,25 @@ fn build_command(argv: Option<Vec<OsString>>) -> CommandBuilder {
                 cb
             }
         }
+    };
+    if cfg!(unix) && term_is_missing(cb.get_env("TERM")) {
+        cb.env("TERM", DEFAULT_TERM);
+        if cb.get_env("COLORTERM").is_none() {
+            cb.env("COLORTERM", "truecolor");
+        }
     }
+    cb
+}
+
+/// The terminal type a session child gets when the daemon has none to pass on.
+const DEFAULT_TERM: &str = "xterm-256color";
+
+/// Whether an inherited `TERM` leaves the child without a usable terminal type.
+/// The daemon often has none: it outlives the terminal that started it, and
+/// launchd, GUI apps and agents have no `TERM`. Without one zsh's line editor
+/// can't move the cursor, so backspace draws a space instead of erasing.
+fn term_is_missing(term: Option<&std::ffi::OsStr>) -> bool {
+    term.is_none_or(|t| t.is_empty() || t == "dumb")
 }
 
 /// Read bytes off the master until EOF (portable-pty maps the closed-slave `EIO`
@@ -329,6 +347,15 @@ mod unix_sig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_or_dumb_term_gets_a_real_one() {
+        use std::ffi::OsStr;
+        assert!(term_is_missing(None));
+        assert!(term_is_missing(Some(OsStr::new(""))));
+        assert!(term_is_missing(Some(OsStr::new("dumb"))));
+        assert!(!term_is_missing(Some(OsStr::new("xterm-kitty"))));
+    }
 
     // GATE: spawn `echo hi` in the shell, read the output bytes, then resize to a
     // new size and assert no error. Also confirms the read-back size and that

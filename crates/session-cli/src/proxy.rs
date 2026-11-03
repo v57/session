@@ -35,7 +35,8 @@
 //! truecolor-capable terminal to the child, the proxy prefixes a custom command
 //! with `env TERM=<term> ...` so the daemon's whitespace-split argv starts with
 //! `env`, which sets `TERM` for the spawned program. The default-shell case
-//! The default-shell case (`cmd == None`) has no such channel and is documented as a limitation. See
+//! (`cmd == None`) has no such channel: it inherits the daemon's `TERM`, or the
+//! daemon's default when that is missing (`session_core::pty`). See
 //! [`attach_frame`].
 
 // The CLI dispatch card (t_ad20f5d9) wires this module into `main.rs` and calls
